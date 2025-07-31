@@ -112,20 +112,39 @@ class QuestionNumberAligner:
                 continue
                 
             # Look for patterns indicating multi-response
+            # Pattern 1: "Question text - Option"
             if ' - ' in col:
                 base_question = col.split(' - ')[0].strip()
                 group = [col]
                 used_columns.add(col)
                 
                 # Find other columns with same base
-                for j, other_col in enumerate(columns[i+1:], i+1):
-                    if other_col.startswith(base_question + ' - '):
+                for j, other_col in enumerate(columns):
+                    if other_col != col and other_col.startswith(base_question + ' - '):
                         group.append(other_col)
                         used_columns.add(other_col)
                 
                 if len(group) > 1:
                     groups[base_question] = group
                     
+            # Pattern 2: Look for "Select all that apply" even without dash
+            elif 'select all that apply' in col.lower():
+                # Extract the base question up to "Select all that apply"
+                base_match = re.search(r'^(.*?select all that apply\.?)', col, re.IGNORECASE)
+                if base_match:
+                    base_question = base_match.group(1).strip()
+                    group = [col]
+                    used_columns.add(col)
+                    
+                    # Find other columns with same base pattern
+                    for j, other_col in enumerate(columns):
+                        if other_col != col and other_col.lower().startswith(base_question.lower()):
+                            group.append(other_col)
+                            used_columns.add(other_col)
+                    
+                    if len(group) > 1:
+                        groups[base_question] = group
+                        
         return groups
     
     def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Dict[str, str]:
@@ -137,57 +156,68 @@ class QuestionNumberAligner:
         # First pass: Find multi-response groups
         multi_groups = self.find_multi_response_groups(columns)
         
-        # Second pass: Match columns to questions
+        # Sort groups by length (process larger groups first)
+        sorted_groups = sorted(multi_groups.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        # Process multi-response groups first
+        for base, group_cols in sorted_groups:
+            best_score = 0
+            best_match = None
+            
+            # Clean the base question for matching
+            clean_base = self.clean_column_name(base)
+            
+            # Find the best matching question
+            for q in questions:
+                if q.number not in used_questions:
+                    score = self.calculate_similarity(clean_base, q.text)
+                    
+                    # Boost score if question has "select all that apply"
+                    if 'select all' in q.text.lower() and 'select all' in base.lower():
+                        score += 0.4
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = q.number
+            
+            # Assign same question number to all columns in group
+            if best_match and best_score > 0.3:  # Lower threshold for groups
+                for group_col in group_cols:
+                    mapping[group_col] = best_match
+                used_questions.add(best_match)
+                print(f"Mapped group '{base}' ({len(group_cols)} items) to Q{best_match}")
+        
+        # Second pass: Match remaining columns
         for col in columns:
             if col in mapping:
                 continue
                 
             best_score = 0
             best_match = None
+            clean_col = self.clean_column_name(col)
             
-            # Check if this column is part of a multi-response group
-            for base, group_cols in multi_groups.items():
-                if col in group_cols:
-                    # Find the question that matches the base
-                    for q in questions:
-                        if q.number not in used_questions:
-                            score = self.calculate_similarity(base, q.text)
-                            if score > best_score:
-                                best_score = score
-                                best_match = q.number
+            for q in questions:
+                if q.number not in used_questions:
+                    score = self.calculate_similarity(clean_col, q.text)
                     
-                    # Assign same question number to all in group
-                    if best_match:
-                        for group_col in group_cols:
-                            mapping[group_col] = best_match
-                        used_questions.add(best_match)
-                    break
+                    # Boost score for demographic questions
+                    if int(q.number) >= 180:  # Demographic section
+                        for demo_type, patterns in self.demographic_patterns.items():
+                            if any(p in clean_col for p in patterns):
+                                score += 0.3
+                                break
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = q.number
             
-            # If not matched yet, try regular matching
-            if col not in mapping:
-                clean_col = self.clean_column_name(col)
-                
-                for q in questions:
-                    if q.number not in used_questions:
-                        score = self.calculate_similarity(clean_col, q.text)
-                        
-                        # Boost score for demographic questions
-                        if int(q.number) >= 180:  # Demographic section
-                            for demo_type, patterns in self.demographic_patterns.items():
-                                if any(p in clean_col for p in patterns):
-                                    score += 0.3
-                                    break
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_match = q.number
-                
-                if best_match and best_score > 0.4:  # Threshold
-                    mapping[col] = best_match
-                    if best_score > 0.7:  # High confidence
-                        used_questions.add(best_match)
-                else:
-                    mapping[col] = 'UNMATCHED'
+            if best_match and best_score > 0.4:  # Threshold
+                mapping[col] = best_match
+                # Only mark as used if high confidence
+                if best_score > 0.7:
+                    used_questions.add(best_match)
+            else:
+                mapping[col] = 'UNMATCHED'
                     
         return mapping
     
@@ -363,6 +393,20 @@ def create_streamlit_app():
             
         # Editable dataframe for manual corrections
         st.markdown("### Review and Edit Mappings")
+        
+        # Add helper button for multi-response questions
+        if st.button("🔧 Fix Multi-Response Questions"):
+            # Find potential multi-response groups that were split
+            for col, q_num in st.session_state.mapping.items():
+                if ' - ' in col and 'select all that apply' in col.lower():
+                    base = col.split(' - ')[0].strip()
+                    # Find all columns with same base
+                    for other_col in st.session_state.mapping:
+                        if other_col.startswith(base + ' - ') and st.session_state.mapping[other_col] != q_num:
+                            st.session_state.mapping[other_col] = q_num
+            st.success("✅ Multi-response questions regrouped!")
+            st.rerun()
+        
         edited_df = st.data_editor(
             display_df,
             column_config={
