@@ -315,8 +315,8 @@ def create_streamlit_app():
                         question_text = match.group(0)
                         # Clean up any trailing table data
                         # Remove patterns like "5. Very" or "1. Not at all" that come from scale headers
-                        question_text = re.sub(r'\s+\d+\.\s+(Very|Somewhat|Neither|Not at all|Strongly).*
-                                              )
+                        question_text = re.sub(r'\s+\d+\.\s+(Very|Somewhat|Neither|Not at all|Strongly).
+                                              
     
     # Run alignment
     if st.session_state.df is not None and st.session_state.questions:
