@@ -1,310 +1,227 @@
 import pandas as pd
 import re
-from typing import Dict, List, Tuple, Optional
 import json
+import base64
+import requests
+from typing import Dict, List
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import streamlit as st
 import numpy as np
 import io
 
-# It's good practice to check for the library and guide the user if it's missing.
-try:
-    import pdfplumber
-except ImportError:
-    st.error("The 'pdfplumber' library is required to read PDF files. Please install it by running: pip install pdfplumber")
-    st.stop()
-
+# --- Data Classes ---
 @dataclass
 class Question:
-    """Represents a question from the PDF"""
+    """Represents a single, clean question extracted from the survey."""
     number: str
     text: str
-    question_type: str  # 'single', 'multi', 'matrix', 'open'
-    options: List[str] = None
+    question_type: str
 
+# --- Core Logic Class ---
 class QuestionNumberAligner:
+    """Handles the logic for parsing questions using AI and matching them to dataset columns."""
+
     def __init__(self):
+        # Keywords to help classify questions after they've been extracted by the AI.
         self.question_patterns = {
-            'multi_response': [
-                'select all that apply',
-                'check all that apply',
-                'please select all',
-                'choose as many'
-            ],
-            'matrix': [
-                'how much do you agree',
-                'please rate',
-                'on a scale',
-                'how appealing'
-            ],
-            'ranking': [
-                'please rank',
-                'rank the following'
-            ]
+            'multi_response': ['select all that apply', 'check all that apply', 'please select all', 'choose as many'],
+            'matrix': ['how much do you agree', 'please rate', 'on a scale', 'how appealing', 'rate the following'],
+            'ranking': ['please rank', 'rank the following']
         }
-        
-        # Common demographic questions for reference
         self.demographic_patterns = {
             'gender': ['gender', 'male', 'female'],
-            'age': ['age', 'years old', 'what is your age'],
-            'income': ['income', 'household income', 'annual income'],
-            'education': ['education', 'highest level', 'degree'],
-            'employment': ['employment', 'work', 'occupation'],
-            'ethnicity': ['hispanic', 'latino', 'ethnicity'],
-            'race': ['race', 'racial', 'black', 'white', 'asian'],
-            'location': ['region', 'state', 'area', 'urban', 'suburban']
+            'age': ['age', 'years old'],
+            'income': ['income', 'household'],
+            'education': ['education', 'degree'],
+            'employment': ['employment', 'work'],
+            'ethnicity': ['hispanic', 'latino'],
+            'race': ['race', 'racial'],
+            'location': ['region', 'state', 'area', 'live']
         }
-        
-    def parse_pdf_questions(self, pdf_text: str) -> List[Question]:
+
+    def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
         """
-        A tailored parser designed specifically for the provided raw text format.
-        It chunks the document by question and aggressively cleans each chunk.
+        Sends a PDF file to the Gemini API to extract questions and returns them as a list of Question objects.
         """
-        questions = []
+        # The API key is handled by the environment, so it can be left blank here.
+        api_key = ""
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
         
-        # Add a newline to the start to ensure the regex catches the first question
-        pdf_text = "\n" + pdf_text
+        # Encode the PDF file bytes into base64.
+        encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
+        
+        # A detailed prompt telling the AI exactly what to do.
+        prompt = """
+        You are an expert data cleaning assistant specializing in survey reports.
+        Analyze the provided PDF document. Your only task is to identify and extract every numbered question.
 
-        # This regex finds the start of each question (a newline followed by digits and a period).
-        # It's used to split the document into chunks, one for each question.
-        question_starts = list(re.finditer(r'\n(\d+)\.\s', pdf_text))
+        Follow these rules strictly:
+        1.  Ignore everything that is not a numbered question. This includes page headers, footers, charts, graphs, data tables, answer choices, and percentages.
+        2.  Extract the full, complete question text, even if it spans multiple lines.
+        3.  Clean the question text perfectly. Remove any trailing text, answer options, or junk characters.
+        4.  Return the output as a single, valid JSON object. The keys should be the question numbers as strings, and the values should be the clean question text.
+        
+        Example of a perfect response:
+        {
+          "1": "To which gender identity do you most identify? Select one.",
+          "3": "What is your age?",
+          "4": "What region of the country do you currently live in?",
+          "6": "Which of the following do you currently own? Select al that apply."
+        }
+        """
+        
+        # Construct the API request payload.
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {
+                            "inlineData": {
+                                "mimeType": "application/pdf",
+                                "data": encoded_pdf
+                            }
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "responseMimeType": "application/json"
+            }
+        }
 
-        for i, start_match in enumerate(question_starts):
-            # The start of the current question's text
-            start_index = start_match.start()
+        try:
+            # Make the API call to Gemini.
+            response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
+            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
             
-            # The end of the current question's text is the start of the next one.
-            # If it's the last question, it goes to the end of the document.
-            end_index = question_starts[i + 1].start() if i + 1 < len(question_starts) else len(pdf_text)
+            response_json = response.json()
             
-            # Get the full text block for this single question
-            question_block = pdf_text[start_index:end_index].strip()
+            # Extract the JSON content from the API's response.
+            candidate = response_json.get('candidates', [])[0]
+            content_part = candidate.get('content', {}).get('parts', [])[0]
+            extracted_json_text = content_part.get('text', '{}')
             
-            # --- Start Cleaning the Block ---
+            # Parse the JSON string into a Python dictionary.
+            question_dict = json.loads(extracted_json_text)
             
-            # 1. Join all lines into one and remove excess whitespace
-            full_text = re.sub(r'\s+', ' ', question_block)
-            
-            # 2. Find the first occurrence of a known "junk" pattern. This is often the
-            #    true end of the question text.
-            junk_patterns = [
-                r'Answer Count Percent',
-                r'Statement Overall',
-                r'Average Rank',
-                r'Min Max',
-                r'Data Table Average Rank',
-                r'Not listed, specify:',
-                r'1 - Do not like at all',
-                r'1 - Boring',
-                r'1 - Irritating',
-                r'1 - Sad',
-                r'1 - Expected',
-                r'1 - Negative',
-                r'1 - Forgettable',
-                r'1 - Generic',
-                r'1 - Confusing',
-                r'1 - Very difficult',
-                r'Excellent Very Good Good',
-                r'Wow for Less :'
-            ]
-            
-            end_of_question_index = len(full_text) # Default to the end
-            for pattern in junk_patterns:
-                match = re.search(pattern, full_text)
-                if match and match.start() < end_of_question_index:
-                    end_of_question_index = match.start()
-            
-            # 3. Truncate the text at the first sign of junk
-            clean_text = full_text[:end_of_question_index].strip()
-            
-            # 4. Extract the number and the final question text
-            final_match = re.match(r'(\d+)\.\s+(.*)', clean_text)
-            if final_match:
-                num, text = final_match.groups()
-                
-                # Final check for trailing colons from answer options
-                if text.endswith(':'):
-                    text = text[:-1].strip()
-
+            # Convert the dictionary into a list of Question objects.
+            questions = []
+            for num, text in question_dict.items():
                 q_type = self._determine_question_type(text)
-                questions.append(Question(num, text, q_type))
+                questions.append(Question(number=str(num), text=text, question_type=q_type))
+            
+            return questions
 
-        return questions
-    
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network error calling Gemini API: {e}")
+            return []
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            st.error(f"Error parsing response from Gemini API: {e}")
+            st.error("The API may have returned an unexpected format. Check the raw response:")
+            st.json(response.json())
+            return []
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {e}")
+            return []
+
     def _determine_question_type(self, text: str) -> str:
-        """Determine question type from text"""
+        """Classifies a question's type based on keywords in its text."""
         text_lower = text.lower()
-        
-        for pattern in self.question_patterns['multi_response']:
-            if pattern in text_lower:
-                return 'multi'
-                
-        for pattern in self.question_patterns['matrix']:
-            if pattern in text_lower:
-                return 'matrix'
-                
-        for pattern in self.question_patterns['ranking']:
-            if pattern in text_lower:
-                return 'ranking'
-                
+        for q_type, patterns in self.question_patterns.items():
+            if any(p in text_lower for p in patterns):
+                return q_type.replace('_response', '')
         return 'single'
-    
+
     def clean_column_name(self, col_name: str) -> str:
-        """Clean and standardize column names"""
-        # Remove special characters and extra spaces
+        """Cleans and standardizes a column name for better matching."""
         cleaned = re.sub(r'[^\w\s-]', ' ', col_name)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned.lower()
-    
+
     def calculate_similarity(self, str1: str, str2: str) -> float:
-        """Calculate similarity between two strings"""
-        # Use SequenceMatcher for fuzzy matching
+        """Calculates a similarity ratio between two strings."""
         return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
-    
+
     def find_multi_response_groups(self, columns: List[str]) -> Dict[str, List[str]]:
-        """Group columns that belong to the same multi-response question"""
+        """Groups columns that likely belong to the same multi-response question."""
         groups = {}
         used_columns = set()
-        
-        for i, col in enumerate(columns):
+        for col in columns:
             if col in used_columns:
                 continue
-                
-            # Pattern 1: "Question text - Option"
             if ' - ' in col:
                 base_question = col.split(' - ')[0].strip()
-                group = [col]
-                used_columns.add(col)
-                
-                # Find other columns with same base
-                for j, other_col in enumerate(columns):
-                    if other_col != col and other_col.startswith(base_question + ' - '):
-                        group.append(other_col)
-                        used_columns.add(other_col)
-                
-                if len(group) > 1:
-                    groups[base_question] = group
-                    
-            # Pattern 2: Look for "Select all that apply" even without dash
-            elif 'select all that apply' in col.lower():
-                # Extract the base question up to "Select all that apply"
-                base_match = re.search(r'^(.*?select all that apply\.?)', col, re.IGNORECASE)
-                if base_match:
-                    base_question = base_match.group(1).strip()
-                    group = [col]
-                    used_columns.add(col)
-                    
-                    # Find other columns with same base pattern
-                    for j, other_col in enumerate(columns):
-                        if other_col != col and other_col.lower().startswith(base_question.lower()):
-                            group.append(other_col)
-                            used_columns.add(other_col)
-                    
-                    if len(group) > 1:
-                        groups[base_question] = group
-                        
+                if len(base_question) < 10: continue
+                current_group = [c for c in columns if c.startswith(base_question + ' - ')]
+                if len(current_group) > 1:
+                    groups[base_question] = current_group
+                    used_columns.update(current_group)
         return groups
-    
+
     def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Dict[str, str]:
-        """Main matching algorithm based on the original logic."""
+        """Main matching algorithm to link dataset columns to the extracted questions."""
         columns = list(df.columns)
         mapping = {}
-        used_questions = set()
-        
-        # First pass: Find multi-response groups
+        used_question_nums = set()
+
         multi_groups = self.find_multi_response_groups(columns)
-        
-        # Sort groups by length (process larger groups first)
-        sorted_groups = sorted(multi_groups.items(), key=lambda x: len(x[1]), reverse=True)
-        
-        # Process multi-response groups first
-        for base, group_cols in sorted_groups:
-            best_score = 0
-            best_match = None
-            
-            clean_base = self.clean_column_name(base)
-            
-            # Find the best matching question
+        for base_question, group_cols in multi_groups.items():
+            clean_base = self.clean_column_name(base_question)
+            best_match_q, highest_score = None, 0.0
             for q in questions:
-                if q.number not in used_questions:
-                    score = self.calculate_similarity(clean_base, q.text)
-                    
-                    # Boost score if question has "select all that apply"
-                    if 'select all' in q.text.lower() and 'select all' in base.lower():
-                        score += 0.4
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = q.number
-            
-            # Assign same question number to all columns in group
-            if best_match and best_score > 0.3:  # Lower threshold for groups
-                for group_col in group_cols:
-                    mapping[group_col] = best_match
-                used_questions.add(best_match)
-        
-        # Second pass: Match remaining columns
+                if q.number in used_question_nums: continue
+                score = self.calculate_similarity(clean_base, q.text)
+                if q.question_type == 'multi': score += 0.2
+                if score > highest_score:
+                    highest_score, best_match_q = score, q
+            if best_match_q and highest_score > 0.3:
+                for col in group_cols:
+                    mapping[col] = best_match_q.number
+                used_question_nums.add(best_match_q.number)
+
         for col in columns:
-            if col in mapping:
-                continue
-            
-            best_score = 0
-            best_match = None
+            if col in mapping: continue
             clean_col = self.clean_column_name(col)
-            
+            best_match_q, highest_score = None, 0.0
             for q in questions:
-                if q.number not in used_questions:
-                    score = self.calculate_similarity(clean_col, q.text)
-                    
-                    # Boost score for demographic questions
-                    try:
-                        if int(q.number) >= 180:  # Demographic section
-                            for demo_type, patterns in self.demographic_patterns.items():
-                                if any(p in clean_col for p in patterns):
-                                    score += 0.3
-                                    break
-                    except ValueError:
-                        pass # q.number might not be a digit
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = q.number
-            
-            if best_match and best_score > 0.4:  # Threshold
-                mapping[col] = best_match
-                # Only mark as used if high confidence
-                if best_score > 0.7:
-                    used_questions.add(best_match)
+                if q.number in used_question_nums: continue
+                score = self.calculate_similarity(clean_col, q.text)
+                if any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns) and \
+                   any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
+                    score += 0.3
+                if score > highest_score:
+                    highest_score, best_match_q = score, q
+            if best_match_q and highest_score > 0.4:
+                mapping[col] = best_match_q.number
+                if highest_score > 0.7: used_question_nums.add(best_match_q.number)
             else:
                 mapping[col] = 'UNMATCHED'
-                
         return mapping
-    
-    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str = "Q{num}. ") -> pd.DataFrame:
-        """Apply the question numbers to the dataset with customizable prefix format"""
+
+    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str) -> pd.DataFrame:
+        """Applies the new question numbers to the dataset's column headers."""
         df_numbered = df.copy()
-        new_columns = {}
-        for col in df_numbered.columns:
-            q_num = mapping.get(col)
-            if q_num and q_num != 'UNMATCHED' and q_num.isdigit():
-                prefix = prefix_format.format(num=q_num)
-                new_columns[col] = f"{prefix}{col}"
-            else:
-                # For non-numeric or unmatched, keep original name
-                new_columns[col] = col
-        
+        new_columns = {
+            col: f"{prefix_format.format(num=mapping.get(col))}{col}"
+            if mapping.get(col) and mapping[col] not in ['UNMATCHED'] and mapping[col].isdigit()
+            else col
+            for col in df_numbered.columns
+        }
         df_numbered.rename(columns=new_columns, inplace=True)
         return df_numbered
 
+# --- Streamlit UI ---
 def create_streamlit_app():
     """Initializes and runs the Streamlit user interface."""
-    st.set_page_config(page_title="Question Number Aligner", layout="wide")
+    st.set_page_config(page_title="AI-Powered Question Aligner", layout="wide")
     
-    st.title("📊 Question Number Alignment Tool")
+    st.title("📊 AI-Powered Question Number Alignment Tool")
+    st.markdown("This tool uses AI to read a survey PDF, extract the questions, and match them to your dataset columns.")
     st.markdown("---")
-    
-    # Initialize session state
+
     if 'mapping' not in st.session_state:
         st.session_state.mapping = None
     if 'df' not in st.session_state:
@@ -314,186 +231,91 @@ def create_streamlit_app():
     
     aligner = QuestionNumberAligner()
 
-    # --- UI Section ---
+    # --- Step 1: Upload Files ---
+    st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
-    
     with col1:
-        st.subheader("📁 Upload Dataset (CSV/Excel)")
-        data_file = st.file_uploader("Choose your dataset file", type=['csv', 'xlsx'])
-        
+        data_file = st.file_uploader("Upload Dataset (CSV/Excel)", type=['csv', 'xlsx'])
     with col2:
-        st.subheader("📄 Upload PDF Overview")
-        pdf_file = st.file_uploader("Choose your PDF file", type=['pdf'])
-        st.info("Note: For demo purposes, you can also paste the question list below")
-        
-    with st.expander("📝 Or paste question list here (for testing)"):
-        question_text_manual = st.text_area(
-            "Paste questions in format: 'number. question text'",
-            height=200,
-            placeholder="1. To which gender identity do you most identify?\n2. What is your age?\n..."
-        )
-        
-    # --- Processing Section ---
+        pdf_file = st.file_uploader("Upload Survey PDF", type=['pdf'])
+
     if data_file:
         try:
-            if data_file.name.endswith('.csv'):
-                st.session_state.df = pd.read_csv(data_file)
-            else:
-                st.session_state.df = pd.read_excel(data_file)
-            st.success(f"✅ Dataset loaded: {len(st.session_state.df)} rows, {len(st.session_state.df.columns)} columns")
+            st.session_state.df = pd.read_csv(data_file) if data_file.name.endswith('.csv') else pd.read_excel(data_file)
+            st.success(f"✅ Dataset loaded: {len(st.session_state.df)} rows, {len(st.session_state.df.columns)} columns.")
         except Exception as e:
-            st.error(f"Failed to load dataset: {e}")
+            st.error(f"Error loading dataset: {e}")
             st.session_state.df = None
 
+    # --- Step 2: Extract Questions with AI ---
+    st.markdown("---")
+    st.subheader("Step 2: Extract Questions from PDF")
     if pdf_file:
-        try:
-            with pdfplumber.open(pdf_file) as pdf:
-                full_pdf_text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
-            
-            if full_pdf_text:
-                st.session_state.questions = aligner.parse_pdf_questions(full_pdf_text)
-                st.success(f"✅ Extracted {len(st.session_state.questions)} questions from PDF using the new tailored parser.")
-                with st.expander("📋 Review extracted questions"):
-                    st.json({q.number: q.text for q in st.session_state.questions})
+        if st.button("🤖 Extract Questions with AI", type="primary", use_container_width=True):
+            with st.spinner("AI is reading and analyzing your PDF... This may take a moment."):
+                pdf_bytes = pdf_file.getvalue()
+                st.session_state.questions = aligner.extract_questions_with_gemini(pdf_bytes)
+            if st.session_state.questions:
+                st.success(f"✅ AI successfully extracted {len(st.session_state.questions)} questions.")
             else:
-                st.warning("Could not extract any text from the PDF.")
-        except Exception as e:
-            st.error(f"Error reading PDF: {str(e)}")
-    
-    elif question_text_manual:
-        st.session_state.questions = aligner.parse_pdf_questions(question_text_manual)
-        st.success(f"✅ Parsed {len(st.session_state.questions)} questions")
-    
-    # --- Alignment and Results Section ---
+                st.error("AI extraction failed. Please check the error messages above or try a different PDF.")
+    else:
+        st.info("Upload a PDF to enable AI question extraction.")
+
+    if st.session_state.questions:
+        with st.expander("📋 Review Extracted Questions"):
+            st.json({q.number: q.text for q in st.session_state.questions})
+
+    # --- Step 3: Run Alignment & Export ---
     if st.session_state.df is not None and st.session_state.questions:
-        if st.button("🚀 Run Automatic Alignment", type="primary"):
+        st.markdown("---")
+        st.subheader("Step 3: Run Alignment & Export")
+        if st.button("🚀 Run Automatic Alignment", use_container_width=True):
             with st.spinner("Analyzing and matching columns..."):
                 st.session_state.mapping = aligner.match_columns_to_questions(
                     st.session_state.df, 
                     st.session_state.questions
                 )
-                
+    
     if st.session_state.mapping:
         st.markdown("---")
         st.subheader("📋 Alignment Results")
         
-        # Create review dataframe
         review_data = []
         for col in st.session_state.df.columns:
             q_num = st.session_state.mapping.get(col, 'UNMATCHED')
-            status = '✏️ Manual'
-            if q_num == 'UNMATCHED':
-                status = '❌ Unmatched'
-            elif str(q_num).isdigit():
-                status = '✅ Matched'
-            elif q_num in ['META', 'ID', 'SKIP']:
-                status = '⚪ Metadata/Skip'
+            status = '✅ Matched' if str(q_num).isdigit() else '❌ Unmatched'
+            review_data.append({'Column Name': col, 'Assigned Question': str(q_num), 'Status': status})
+        
+        review_df = pd.DataFrame(review_data).set_index('Column Name')
+        
+        st.markdown("##### Review and Edit Mappings")
+        edited_df = st.data_editor(review_df, use_container_width=True, height=400)
 
-            review_data.append({
-                'Column Name': col,
-                'Assigned Question': str(q_num),
-                'Status': status
-            })
-        
-        review_df = pd.DataFrame(review_data)
-        
-        # Summary metrics
-        total_cols = len(review_df)
-        matched = (review_df['Status'] == '✅ Matched').sum()
-        unmatched = (review_df['Status'] == '❌ Unmatched').sum()
-        
-        m_col1, m_col2, m_col3 = st.columns(3)
-        m_col1.metric("Total Columns", total_cols)
-        m_col2.metric("Matched", matched, f"{matched/total_cols*100:.1f}%" if total_cols > 0 else "0.0%")
-        m_col3.metric("Unmatched", unmatched)
-            
-        # Filter options
-        filter_option = st.radio("Show:", ["All", "Matched only", "Unmatched only"], horizontal=True)
-        
-        display_df = review_df
-        if filter_option == "Matched only":
-            display_df = review_df[review_df['Status'] == '✅ Matched']
-        elif filter_option == "Unmatched only":
-            display_df = review_df[review_df['Status'] == '❌ Unmatched']
-        
-        # Editable dataframe
-        st.markdown("### Review and Edit Mappings")
-        edited_df = st.data_editor(
-            display_df,
-            column_config={
-                "Column Name": st.column_config.TextColumn("Column Name", width="large", disabled=True),
-                "Assigned Question": st.column_config.TextColumn("Assigned Question", help="Edit question numbers here"),
-                "Status": st.column_config.TextColumn("Status", disabled=True)
-            },
-            use_container_width=True,
-            num_rows="dynamic"
+        for col_name, row in edited_df.iterrows():
+            st.session_state.mapping[col_name] = row['Assigned Question']
+
+        st.markdown("##### Export Your Renumbered Dataset")
+        prefix_format = st.selectbox(
+            "Question Number Format",
+            ["Q{num}. ", "{num}. ", "#{num}. ", "Question {num}: "],
+            help="Choose how question numbers are prefixed to column names."
         )
         
-        if st.button("✏️ Apply Manual Corrections"):
-            # Create a mapping from the original index to the new values
-            update_map = {row['Column Name']: row['Assigned Question'] for index, row in edited_df.iterrows()}
-            # Update the main session state mapping
-            for col_name, new_q_num in update_map.items():
-                st.session_state.mapping[col_name] = new_q_num
-            st.success("✅ Manual corrections applied!")
-            st.rerun()
-            
-        # --- Export Section ---
-        st.markdown("---")
-        st.subheader("💾 Export Options")
-        
-        e_col1, e_col2 = st.columns(2)
-        with e_col1:
-            prefix_format = st.selectbox(
-                "Question Number Format",
-                ["Q{num}. ", "{num}. ", "#{num}. ", "Question {num}: ", "Q{num} - ", "{num}) "],
-                help="Choose how question numbers appear in the export"
-            )
-            st.caption(f"Preview: {prefix_format.format(num='1')}Your question text here")
-
-        with e_col2:
-            include_unmatched = st.checkbox("Include unmatched columns in export", value=True)
-        
-        # Generate Numbered Dataset
-        numbered_df = aligner.apply_numbering_to_dataset(
-            st.session_state.df, 
-            st.session_state.mapping, 
-            prefix_format=prefix_format
-        )
-        
-        if not include_unmatched:
-            # Filter out columns that were not successfully matched
-            cols_to_keep = [
-                col for original_col, col in zip(st.session_state.df.columns, numbered_df.columns)
-                if st.session_state.mapping.get(original_col, 'UNMATCHED') not in ['UNMATCHED']
-            ]
-            numbered_df = numbered_df[cols_to_keep]
-
-        # Prepare for download
-        csv_data = numbered_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8')
+        final_df = aligner.apply_numbering_to_dataset(st.session_state.df, st.session_state.mapping, prefix_format)
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            numbered_df.to_excel(writer, index=False, sheet_name='Numbered Data')
+            final_df.to_excel(writer, index=False, sheet_name='Numbered Data')
         excel_data = output.getvalue()
 
-        dl_col1, dl_col2 = st.columns(2)
-        with dl_col1:
-            st.download_button(
-                label="📊 Download Numbered Dataset (CSV)",
-                data=csv_data,
-                file_name="numbered_dataset.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        with dl_col2:
-            st.download_button(
-                label="📑 Download Numbered Dataset (Excel)",
-                data=excel_data,
-                file_name="numbered_dataset.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+        st.download_button(
+            label="📑 Download Renumbered Dataset (Excel)",
+            data=excel_data,
+            file_name="renumbered_dataset.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
 if __name__ == "__main__":
     create_streamlit_app()
