@@ -398,26 +398,23 @@ def create_streamlit_app():
         # Editable dataframe for manual corrections
         st.markdown("### Review and Edit Mappings")
         
-        # Add helper button for multi-response questions
-        if st.button("🔧 Fix Multi-Response Questions"):
-            # Find potential multi-response groups that were split
-            for col, q_num in st.session_state.mapping.items():
-                if ' - ' in col and 'select all that apply' in col.lower():
-                    base = col.split(' - ')[0].strip()
-                    # Find all columns with same base
-                    for other_col in st.session_state.mapping:
-                        if other_col.startswith(base + ' - ') and st.session_state.mapping[other_col] != q_num:
-                            st.session_state.mapping[other_col] = q_num
-            st.success("✅ Multi-response questions regrouped!")
-            st.rerun()
-        
         edited_df = st.data_editor(
             display_df,
             column_config={
+                "Column Name": st.column_config.TextColumn(
+                    "Column Name",
+                    help="Original column name from your dataset",
+                    width="large",  # Make column wider
+                    max_chars=500  # Allow long text
+                ),
                 "Assigned Question": st.column_config.TextColumn(
                     "Assigned Question",
                     help="Edit question numbers here",
                     width="small",
+                ),
+                "Status": st.column_config.TextColumn(
+                    "Status",
+                    width="small"
                 )
             },
             num_rows="fixed",
