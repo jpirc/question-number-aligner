@@ -248,7 +248,12 @@ def create_streamlit_app():
         for col in st.session_state.df.columns:
             q_num = st.session_state.mapping.get(col, 'UNMATCHED')
             status = '✅ Matched' if str(q_num).isdigit() else '❌ Unmatched'
-            matched_text = question_lookup.get(q_num, "N/A - Unmatched")
+            
+            # Prepend the question number to the text for easy review
+            if status == '✅ Matched':
+                matched_text = f"Q{q_num}. {question_lookup.get(q_num, 'Text not found.')}"
+            else:
+                matched_text = "N/A - Unmatched"
             
             review_data.append({
                 'Column Name': col,
