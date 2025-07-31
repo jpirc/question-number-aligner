@@ -198,13 +198,10 @@ class QuestionNumberAligner:
         
         for col in df.columns:
             if col in mapping and mapping[col] != 'UNMATCHED':
-                # Check if it's part of a multi-response
-                if ' - ' in col:
-                    option = col.split(' - ', 1)[1] if ' - ' in col else col
-                    new_col = f"Q{mapping[col]}. {option}"
-                else:
-                    new_col = f"Q{mapping[col]}. {col}"
+                # Simply prepend the question number to the original column name
+                new_col = f"Q{mapping[col]}. {col}"
             else:
+                # Keep original name for unmatched columns
                 new_col = col
                 
             new_columns.append(new_col)
