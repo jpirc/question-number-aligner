@@ -29,7 +29,8 @@ class QuestionNumberAligner:
             'multi_response': [
                 'select all that apply',
                 'check all that apply',
-                'please select all'
+                'please select all',
+                'choose as many'
             ],
             'matrix': [
                 'how much do you agree',
@@ -57,48 +58,78 @@ class QuestionNumberAligner:
         
     def parse_pdf_questions(self, pdf_text: str) -> List[Question]:
         """
-        Parse questions from PDF text with improved logic to handle multi-line questions
-        and clean up common PDF extraction artifacts.
+        A tailored parser designed specifically for the provided raw text format.
+        It chunks the document by question and aggressively cleans each chunk.
         """
         questions = []
+        
+        # Add a newline to the start to ensure the regex catches the first question
+        pdf_text = "\n" + pdf_text
 
-        # This regex splits the text into blocks, with each block starting with a question number.
-        # It uses a positive lookahead `(?=...)` to split the text *before* the pattern, keeping the delimiter.
-        question_blocks = re.split(r'(?=\n^\d+\.\s)', pdf_text, flags=re.MULTILINE)
+        # This regex finds the start of each question (a newline followed by digits and a period).
+        # It's used to split the document into chunks, one for each question.
+        question_starts = list(re.finditer(r'\n(\d+)\.\s', pdf_text))
 
-        for block in question_blocks:
-            block = block.strip()
-            if not block:
-                continue
-
-            # This regex captures the question number and all the text that follows within the block.
-            match = re.match(r'^(\d+)\.\s+(.*)', block, re.DOTALL)
-            if match:
-                num = match.group(1)
-                # Join multi-line text into a single line and clean up extra whitespace.
-                text = re.sub(r'\s+', ' ', match.group(2)).strip()
-
-                # --- Text Cleaning Logic ---
-
-                # 1. Remove rating scales that are often incorrectly appended to question text.
-                #    e.g., "...following statements? 5. Strongly 4. Somewhat..."
-                text = re.sub(r'\s+\d\.\s+(Strongly|Somewhat|Neither|Not at all).+', '', text, flags=re.IGNORECASE)
-
-                # 2. If a question mark exists, truncate the string after it. This is a strong
-                #    indicator of the end of the actual question, removing trailing junk.
-                if '?' in text:
-                    text = text.split('?')[0] + '?'
-
-                # 3. Handle duplicated text, a common PDF extraction artifact where the question
-                #    is repeated. e.g., "Question text? 30. Question text?"
-                mid_string_q_num = f' {num}. '
-                if mid_string_q_num in text:
-                    # If the question number appears again mid-string, split on it and keep the first part.
-                    text = text.split(mid_string_q_num)[0]
+        for i, start_match in enumerate(question_starts):
+            # The start of the current question's text
+            start_index = start_match.start()
+            
+            # The end of the current question's text is the start of the next one.
+            # If it's the last question, it goes to the end of the document.
+            end_index = question_starts[i + 1].start() if i + 1 < len(question_starts) else len(pdf_text)
+            
+            # Get the full text block for this single question
+            question_block = pdf_text[start_index:end_index].strip()
+            
+            # --- Start Cleaning the Block ---
+            
+            # 1. Join all lines into one and remove excess whitespace
+            full_text = re.sub(r'\s+', ' ', question_block)
+            
+            # 2. Find the first occurrence of a known "junk" pattern. This is often the
+            #    true end of the question text.
+            junk_patterns = [
+                r'Answer Count Percent',
+                r'Statement Overall',
+                r'Average Rank',
+                r'Min Max',
+                r'Data Table Average Rank',
+                r'Not listed, specify:',
+                r'1 - Do not like at all',
+                r'1 - Boring',
+                r'1 - Irritating',
+                r'1 - Sad',
+                r'1 - Expected',
+                r'1 - Negative',
+                r'1 - Forgettable',
+                r'1 - Generic',
+                r'1 - Confusing',
+                r'1 - Very difficult',
+                r'Excellent Very Good Good',
+                r'Wow for Less :'
+            ]
+            
+            end_of_question_index = len(full_text) # Default to the end
+            for pattern in junk_patterns:
+                match = re.search(pattern, full_text)
+                if match and match.start() < end_of_question_index:
+                    end_of_question_index = match.start()
+            
+            # 3. Truncate the text at the first sign of junk
+            clean_text = full_text[:end_of_question_index].strip()
+            
+            # 4. Extract the number and the final question text
+            final_match = re.match(r'(\d+)\.\s+(.*)', clean_text)
+            if final_match:
+                num, text = final_match.groups()
+                
+                # Final check for trailing colons from answer options
+                if text.endswith(':'):
+                    text = text[:-1].strip()
 
                 q_type = self._determine_question_type(text)
-                questions.append(Question(num, text.strip(), q_type))
-        
+                questions.append(Question(num, text, q_type))
+
         return questions
     
     def _determine_question_type(self, text: str) -> str:
@@ -314,23 +345,14 @@ def create_streamlit_app():
             st.error(f"Failed to load dataset: {e}")
             st.session_state.df = None
 
-    question_text_to_parse = ""
     if pdf_file:
         try:
-            # Use the full text from the PDF for the new parser
             with pdfplumber.open(pdf_file) as pdf:
                 full_pdf_text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
             
-            # --- START OF DEBUGGING CODE ---
-            # This section is for debugging PDF parsing.
-            st.subheader("Raw Extracted PDF Text")
-            st.text_area("Copy this text", full_pdf_text, height=300)
-            # --- END OF DEBUGGING CODE ---
-
             if full_pdf_text:
                 st.session_state.questions = aligner.parse_pdf_questions(full_pdf_text)
-                st.success(f"✅ Extracted {len(st.session_state.questions)} questions from PDF using improved parser.")
-                # Show the cleaned, extracted questions for review
+                st.success(f"✅ Extracted {len(st.session_state.questions)} questions from PDF using the new tailored parser.")
                 with st.expander("📋 Review extracted questions"):
                     st.json({q.number: q.text for q in st.session_state.questions})
             else:
