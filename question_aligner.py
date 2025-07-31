@@ -308,6 +308,7 @@ def create_streamlit_app():
                 question_lines = []
                 for line in pdf_text.split('\n'):
                     # Match lines that start with a number followed by a period
+                    # Capture the ENTIRE line as-is
                     if re.match(r'^\d+\.\s+', line.strip()):
                         question_lines.append(line.strip())
                 
