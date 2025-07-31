@@ -309,13 +309,23 @@ def create_streamlit_app():
         st.markdown("---")
         st.subheader("📋 Alignment Results")
         
-        # Create review dataframe
+       # Create review dataframe
         review_data = []
         for col, q_num in st.session_state.mapping.items():
+            # Determine status based on current mapping
+            if q_num == 'UNMATCHED':
+                status = '❌ Unmatched'
+            elif q_num in ['META', 'ID', 'SKIP']:
+                status = '⚪ Metadata/Skip'
+            elif q_num.isdigit():
+                status = '✅ Matched'
+            else:
+                status = '✏️ Manual'
+                
             review_data.append({
                 'Column Name': col,
                 'Assigned Question': q_num,
-                'Status': '✅ Matched' if q_num != 'UNMATCHED' else '❌ Unmatched'
+                'Status': status
             })
             
         review_df = pd.DataFrame(review_data)
@@ -361,12 +371,15 @@ def create_streamlit_app():
             use_container_width=True
         )
         
-        # Apply changes button
+                # Apply changes button
         if st.button("✏️ Apply Manual Corrections"):
             # Update mapping with edits
             for _, row in edited_df.iterrows():
                 st.session_state.mapping[row['Column Name']] = row['Assigned Question']
             st.success("✅ Manual corrections applied!")
+            
+            # Refresh the display to show updated statuses
+            st.rerun()
             
         # Export options
         st.markdown("---")
