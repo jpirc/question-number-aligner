@@ -321,14 +321,18 @@ def create_streamlit_app():
             with pdfplumber.open(pdf_file) as pdf:
                 full_pdf_text = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
             
+            # --- START OF DEBUGGING CODE ---
+            # This section is for debugging PDF parsing.
+            st.subheader("Raw Extracted PDF Text")
+            st.text_area("Copy this text", full_pdf_text, height=300)
+            # --- END OF DEBUGGING CODE ---
+
             if full_pdf_text:
                 st.session_state.questions = aligner.parse_pdf_questions(full_pdf_text)
                 st.success(f"✅ Extracted {len(st.session_state.questions)} questions from PDF using improved parser.")
                 # Show the cleaned, extracted questions for review
                 with st.expander("📋 Review extracted questions"):
                     st.json({q.number: q.text for q in st.session_state.questions})
-            st.subheader("Raw Extracted PDF Text")
-            st.text_area("Copy this text", full_pdf_text, height=300)
             else:
                 st.warning("Could not extract any text from the PDF.")
         except Exception as e:
