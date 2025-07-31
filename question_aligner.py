@@ -327,6 +327,8 @@ def create_streamlit_app():
                 # Show the cleaned, extracted questions for review
                 with st.expander("📋 Review extracted questions"):
                     st.json({q.number: q.text for q in st.session_state.questions})
+            st.subheader("Raw Extracted PDF Text")
+            st.text_area("Copy this text", full_pdf_text, height=300)
             else:
                 st.warning("Could not extract any text from the PDF.")
         except Exception as e:
