@@ -191,15 +191,20 @@ class QuestionNumberAligner:
                     
         return mapping
     
-    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-        """Apply the question numbers to the dataset"""
+    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str = "Q{num}. ") -> pd.DataFrame:
+        """Apply the question numbers to the dataset with customizable prefix format"""
         # Create new column names with question numbers
         new_columns = []
         
         for col in df.columns:
             if col in mapping and mapping[col] != 'UNMATCHED':
-                # Simply prepend the question number to the original column name
-                new_col = f"Q{mapping[col]}. {col}"
+                # Format the question number using the specified format
+                if mapping[col].isdigit():
+                    prefix = prefix_format.format(num=mapping[col])
+                    new_col = f"{prefix}{col}"
+                else:
+                    # For non-numeric mappings (META, ID, etc), don't add prefix
+                    new_col = col
             else:
                 # Keep original name for unmatched columns
                 new_col = col
@@ -309,7 +314,7 @@ def create_streamlit_app():
         st.markdown("---")
         st.subheader("📋 Alignment Results")
         
-       # Create review dataframe
+        # Create review dataframe
         review_data = []
         for col, q_num in st.session_state.mapping.items():
             # Determine status based on current mapping
@@ -371,7 +376,7 @@ def create_streamlit_app():
             use_container_width=True
         )
         
-                # Apply changes button
+        # Apply changes button
         if st.button("✏️ Apply Manual Corrections"):
             # Update mapping with edits
             for _, row in edited_df.iterrows():
@@ -385,14 +390,53 @@ def create_streamlit_app():
         st.markdown("---")
         st.subheader("💾 Export Options")
         
+        # Add prefix format selector
+        col1, col2 = st.columns(2)
+        with col1:
+            prefix_format = st.selectbox(
+                "Question Number Format",
+                ["Q{num}. ", "{num}. ", "#{num}. ", "Question {num}: ", "Q{num} - ", "{num}) "],
+                help="Choose how question numbers appear in the export"
+            )
+            
+            # Show preview
+            st.caption(f"Preview: {prefix_format.format(num='1')}Your question text here")
+        
+        with col2:
+            # Add checkbox for including/excluding unmatched columns
+            include_unmatched = st.checkbox(
+                "Include unmatched columns in export", 
+                value=True,
+                help="Uncheck to exclude columns that couldn't be matched to questions"
+            )
+        
+        # Custom prefix option
+        use_custom = st.checkbox("Use custom format")
+        if use_custom:
+            custom_format = st.text_input(
+                "Custom format (use {num} for the question number)",
+                value="Q{num}. ",
+                help="Examples: 'Q{num}. ' or 'Question {num}: ' or '{num}) '"
+            )
+            prefix_format = custom_format
+        
         col1, col2 = st.columns(2)
         
         with col1:
             if st.button("📊 Generate Numbered Dataset"):
+                # Apply numbering with custom prefix
                 numbered_df = aligner.apply_numbering_to_dataset(
                     st.session_state.df, 
-                    st.session_state.mapping
+                    st.session_state.mapping,
+                    prefix_format=prefix_format
                 )
+                
+                # Filter out unmatched columns if requested
+                if not include_unmatched:
+                    # Get columns that have valid question numbers
+                    matched_cols = [col for col in numbered_df.columns 
+                                  if not any(unmatch in col for unmatch in ['UNMATCHED', 'META', 'ID'])]
+                    numbered_df = numbered_df[matched_cols]
                 
                 # Offer both CSV and Excel options
                 st.markdown("##### Download Format:")
