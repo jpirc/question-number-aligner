@@ -45,7 +45,6 @@ class QuestionNumberAligner:
         Sends a PDF file to the Gemini API to extract questions and returns them as a list of Question objects.
         """
         # Securely get the API key from Streamlit's secrets manager.
-        # The user must set this in their app's settings.
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         if not api_key:
             st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
@@ -53,10 +52,8 @@ class QuestionNumberAligner:
 
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
         
-        # Encode the PDF file bytes into base64.
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
-        # A detailed prompt telling the AI exactly what to do.
         prompt = """
         You are an expert data cleaning assistant specializing in survey reports.
         Analyze the provided PDF document. Your only task is to identify and extract every numbered question.
@@ -76,48 +73,23 @@ class QuestionNumberAligner:
         }
         """
         
-        # Construct the API request payload.
         payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": prompt},
-                        {
-                            "inlineData": {
-                                "mimeType": "application/pdf",
-                                "data": encoded_pdf
-                            }
-                        }
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "responseMimeType": "application/json"
-            }
+            "contents": [{"role": "user", "parts": [{"text": prompt}, {"inlineData": {"mimeType": "application/pdf", "data": encoded_pdf}}]}],
+            "generationConfig": {"responseMimeType": "application/json"}
         }
 
         try:
-            # Make the API call to Gemini.
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
-            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
-            
+            response.raise_for_status()
             response_json = response.json()
             
-            # Extract the JSON content from the API's response.
-            candidate = response_json.get('candidates', [])[0]
-            content_part = candidate.get('content', {}).get('parts', [])[0]
+            candidate = response_json.get('candidates', [{}])[0]
+            content_part = candidate.get('content', {}).get('parts', [{}])[0]
             extracted_json_text = content_part.get('text', '{}')
             
-            # Parse the JSON string into a Python dictionary.
             question_dict = json.loads(extracted_json_text)
             
-            # Convert the dictionary into a list of Question objects.
-            questions = []
-            for num, text in question_dict.items():
-                q_type = self._determine_question_type(text)
-                questions.append(Question(number=str(num), text=text, question_type=q_type))
-            
+            questions = [Question(number=str(num), text=text, question_type=self._determine_question_type(text)) for num, text in question_dict.items()]
             return questions
 
         except requests.exceptions.RequestException as e:
@@ -133,7 +105,6 @@ class QuestionNumberAligner:
             return []
 
     def _determine_question_type(self, text: str) -> str:
-        """Classifies a question's type based on keywords in its text."""
         text_lower = text.lower()
         for q_type, patterns in self.question_patterns.items():
             if any(p in text_lower for p in patterns):
@@ -141,22 +112,18 @@ class QuestionNumberAligner:
         return 'single'
 
     def clean_column_name(self, col_name: str) -> str:
-        """Cleans and standardizes a column name for better matching."""
         cleaned = re.sub(r'[^\w\s-]', ' ', col_name)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned.lower()
 
     def calculate_similarity(self, str1: str, str2: str) -> float:
-        """Calculates a similarity ratio between two strings."""
         return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
 
     def find_multi_response_groups(self, columns: List[str]) -> Dict[str, List[str]]:
-        """Groups columns that likely belong to the same multi-response question."""
         groups = {}
         used_columns = set()
         for col in columns:
-            if col in used_columns:
-                continue
+            if col in used_columns: continue
             if ' - ' in col:
                 base_question = col.split(' - ')[0].strip()
                 if len(base_question) < 10: continue
@@ -167,7 +134,6 @@ class QuestionNumberAligner:
         return groups
 
     def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Dict[str, str]:
-        """Main matching algorithm to link dataset columns to the extracted questions."""
         columns = list(df.columns)
         mapping = {}
         used_question_nums = set()
@@ -207,7 +173,6 @@ class QuestionNumberAligner:
         return mapping
 
     def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str) -> pd.DataFrame:
-        """Applies the new question numbers to the dataset's column headers."""
         df_numbered = df.copy()
         new_columns = {
             col: f"{prefix_format.format(num=mapping.get(col))}{col}"
@@ -220,23 +185,18 @@ class QuestionNumberAligner:
 
 # --- Streamlit UI ---
 def create_streamlit_app():
-    """Initializes and runs the Streamlit user interface."""
     st.set_page_config(page_title="AI-Powered Question Aligner", layout="wide")
     
     st.title("📊 AI-Powered Question Number Alignment Tool")
     st.markdown("This tool uses AI to read a survey PDF, extract the questions, and match them to your dataset columns.")
     st.markdown("---")
 
-    if 'mapping' not in st.session_state:
-        st.session_state.mapping = None
-    if 'df' not in st.session_state:
-        st.session_state.df = None
-    if 'questions' not in st.session_state:
-        st.session_state.questions = []
+    if 'mapping' not in st.session_state: st.session_state.mapping = None
+    if 'df' not in st.session_state: st.session_state.df = None
+    if 'questions' not in st.session_state: st.session_state.questions = []
     
     aligner = QuestionNumberAligner()
 
-    # --- Step 1: Upload Files ---
     st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
     with col1:
@@ -252,7 +212,6 @@ def create_streamlit_app():
             st.error(f"Error loading dataset: {e}")
             st.session_state.df = None
 
-    # --- Step 2: Extract Questions with AI ---
     st.markdown("---")
     st.subheader("Step 2: Extract Questions from PDF")
     if pdf_file:
@@ -271,31 +230,51 @@ def create_streamlit_app():
         with st.expander("📋 Review Extracted Questions"):
             st.json({q.number: q.text for q in st.session_state.questions})
 
-    # --- Step 3: Run Alignment & Export ---
     if st.session_state.df is not None and st.session_state.questions:
         st.markdown("---")
         st.subheader("Step 3: Run Alignment & Export")
         if st.button("🚀 Run Automatic Alignment", use_container_width=True):
             with st.spinner("Analyzing and matching columns..."):
-                st.session_state.mapping = aligner.match_columns_to_questions(
-                    st.session_state.df, 
-                    st.session_state.questions
-                )
+                st.session_state.mapping = aligner.match_columns_to_questions(st.session_state.df, st.session_state.questions)
     
     if st.session_state.mapping:
         st.markdown("---")
         st.subheader("📋 Alignment Results")
         
+        # Create a lookup dictionary for question text
+        question_lookup = {q.number: q.text for q in st.session_state.questions}
+        
         review_data = []
         for col in st.session_state.df.columns:
             q_num = st.session_state.mapping.get(col, 'UNMATCHED')
             status = '✅ Matched' if str(q_num).isdigit() else '❌ Unmatched'
-            review_data.append({'Column Name': col, 'Assigned Question': str(q_num), 'Status': status})
+            matched_text = question_lookup.get(q_num, "N/A - Unmatched")
+            
+            review_data.append({
+                'Column Name': col,
+                'Matched Question Text': matched_text,
+                'Assigned Question': str(q_num),
+                'Status': status
+            })
         
         review_df = pd.DataFrame(review_data).set_index('Column Name')
         
         st.markdown("##### Review and Edit Mappings")
-        edited_df = st.data_editor(review_df, use_container_width=True, height=400)
+        st.info("Review the AI's matches below. You can manually correct the 'Assigned Question' number for any column.")
+        
+        # Reorder columns for better review flow
+        column_order = ["Matched Question Text", "Assigned Question", "Status"]
+        
+        edited_df = st.data_editor(
+            review_df[column_order],
+            column_config={
+                "Matched Question Text": st.column_config.TextColumn("Matched Question Text", width="large", help="The question text matched by the AI.", disabled=True),
+                "Assigned Question": st.column_config.TextColumn("Assigned Question", help="Edit the question number here if the match is incorrect."),
+                "Status": st.column_config.TextColumn("Status", disabled=True)
+            },
+            use_container_width=True,
+            height=400
+        )
 
         for col_name, row in edited_df.iterrows():
             st.session_state.mapping[col_name] = row['Assigned Question']
