@@ -6,22 +6,33 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 import streamlit as st
 import numpy as np
+import io
+
+# It's good practice to check for the library and guide the user if it's missing.
+try:
+    import pdfplumber
+except ImportError:
+    st.error("The 'pdfplumber' library is required to read PDF files. Please install it by running: pip install pdfplumber")
+    st.stop()
 
 @dataclass
 class Question:
-    """Represents a question from the PDF"""
+    """Represents a question from the PDF survey overview."""
     number: str
     text: str
-    question_type: str  # 'single', 'multi', 'matrix', 'open'
+    question_type: str  # 'single', 'multi', 'matrix', 'open', 'ranking'
     options: List[str] = None
-    
+
 class QuestionNumberAligner:
+    """Handles the core logic of matching dataset columns to survey questions."""
     def __init__(self):
+        # Keywords to identify different types of questions from their text.
         self.question_patterns = {
             'multi_response': [
                 'select all that apply',
                 'check all that apply',
-                'please select all'
+                'please select all',
+                'which of the following'
             ],
             'matrix': [
                 'how much do you agree',
@@ -35,7 +46,7 @@ class QuestionNumberAligner:
             ]
         }
         
-        # Common demographic questions for reference
+        # Common demographic question keywords to improve matching for that section.
         self.demographic_patterns = {
             'gender': ['gender', 'male', 'female'],
             'age': ['age', 'years old', 'what is your age'],
@@ -44,726 +55,340 @@ class QuestionNumberAligner:
             'employment': ['employment', 'work', 'occupation'],
             'ethnicity': ['hispanic', 'latino', 'ethnicity'],
             'race': ['race', 'racial', 'black', 'white', 'asian'],
-            'location': ['region', 'state', 'area', 'urban', 'suburban']
+            'location': ['region', 'state', 'area', 'urban', 'suburban', 'zip code']
         }
-        
-    def parse_pdf_questions(self, pdf_text: str) -> List[Question]:
-        """Parse questions from PDF text"""
+
+    def parse_questions_from_text(self, text_content: str) -> List[Question]:
+        """
+        Parses a list of questions from a block of text.
+        This improved regex handles multi-line questions better.
+        """
         questions = []
+        # Regex to find lines starting with a number and a period.
+        # It captures the number and the following text until the next question number.
+        pattern = re.compile(r'^(?P<number>\d+)\.\s+(?P<text>.+?)(?=\n\d+\.|\Z)', re.DOTALL | re.MULTILINE)
         
-        # This is a simplified parser - in reality you'd parse the actual PDF
-        # For now, I'll create a pattern that matches the structure you showed
-        lines = pdf_text.split('\n')
-        current_question = None
-        
-        for line in lines:
-            # Match question number and text
-            match = re.match(r'^(\d+)\.\s+(.+)', line)
-            if match:
-                if current_question:
-                    questions.append(current_question)
-                
-                num, text = match.groups()
-                q_type = self._determine_question_type(text)
-                current_question = Question(num, text, q_type)
-                
-        if current_question:
-            questions.append(current_question)
+        for match in pattern.finditer(text_content):
+            num = match.group('number')
+            # Clean up the text: remove newlines and extra spaces
+            text = re.sub(r'\s+', ' ', match.group('text')).strip()
+            
+            # Further cleanup to remove artifacts from PDF tables/scales
+            text = re.sub(r'\s+\d+\s+(Very|Somewhat|Neither|Not at all|Strongly)\s?.*', '', text, flags=re.IGNORECASE)
+            
+            q_type = self._determine_question_type(text)
+            questions.append(Question(number=num, text=text, question_type=q_type))
             
         return questions
-    
+
     def _determine_question_type(self, text: str) -> str:
-        """Determine question type from text"""
+        """Determines the question type based on keywords."""
         text_lower = text.lower()
-        
-        for pattern in self.question_patterns['multi_response']:
-            if pattern in text_lower:
-                return 'multi'
-                
-        for pattern in self.question_patterns['matrix']:
-            if pattern in text_lower:
-                return 'matrix'
-                
-        for pattern in self.question_patterns['ranking']:
-            if pattern in text_lower:
-                return 'ranking'
-                
+        for q_type, patterns in self.question_patterns.items():
+            if any(p in text_lower for p in patterns):
+                return q_type.replace('_response', '')
         return 'single'
-    
+
     def clean_column_name(self, col_name: str) -> str:
-        """Clean and standardize column names"""
-        # Remove special characters and extra spaces
+        """Cleans and standardizes a column name for better matching."""
+        # Remove special characters, except for hyphens which can be meaningful.
         cleaned = re.sub(r'[^\w\s-]', ' ', col_name)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned.lower()
-    
+
     def calculate_similarity(self, str1: str, str2: str) -> float:
-        """Calculate similarity between two strings"""
-        # Use SequenceMatcher for fuzzy matching
+        """Calculates a similarity ratio between two strings."""
         return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
-    
+
     def find_multi_response_groups(self, columns: List[str]) -> Dict[str, List[str]]:
-        """Group columns that belong to the same multi-response question"""
+        """Groups columns that likely belong to the same multi-response question."""
         groups = {}
         used_columns = set()
-        
+
         for i, col in enumerate(columns):
             if col in used_columns:
                 continue
-                
-            # Look for patterns indicating multi-response
-            # Pattern 1: "Question text - Option"
+
+            # Common pattern: "Question Text - Option"
             if ' - ' in col:
                 base_question = col.split(' - ')[0].strip()
-                group = [col]
-                used_columns.add(col)
-                
-                # Find other columns with same base
-                for j, other_col in enumerate(columns):
+                # Avoid grouping if the base is too short (e.g., "Q1")
+                if len(base_question) < 10: continue
+
+                current_group = [col]
+                for other_col in columns:
                     if other_col != col and other_col.startswith(base_question + ' - '):
-                        group.append(other_col)
-                        used_columns.add(other_col)
+                        current_group.append(other_col)
                 
-                if len(group) > 1:
-                    groups[base_question] = group
-                    
-            # Pattern 2: Look for "Select all that apply" even without dash
-            elif 'select all that apply' in col.lower():
-                # Extract the base question up to "Select all that apply"
-                base_match = re.search(r'^(.*?select all that apply\.?)', col, re.IGNORECASE)
-                if base_match:
-                    base_question = base_match.group(1).strip()
-                    group = [col]
-                    used_columns.add(col)
-                    
-                    # Find other columns with same base pattern
-                    for j, other_col in enumerate(columns):
-                        if other_col != col and other_col.lower().startswith(base_question.lower()):
-                            group.append(other_col)
-                            used_columns.add(other_col)
-                    
-                    if len(group) > 1:
-                        groups[base_question] = group
-                        
+                if len(current_group) > 1:
+                    groups[base_question] = current_group
+                    used_columns.update(current_group)
+        
         return groups
-    
-    def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Dict[str, str]:
-        """Main matching algorithm"""
+
+    def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question], similarity_threshold: float = 0.4) -> Dict[str, str]:
+        """
+        The main matching algorithm. It maps DataFrame columns to question numbers.
+        """
         columns = list(df.columns)
         mapping = {}
-        used_questions = set()
-        
-        # First pass: Find multi-response groups
+        used_question_nums = set()
+
+        # First pass: Handle multi-response groups
         multi_groups = self.find_multi_response_groups(columns)
-        
-        # Sort groups by length (process larger groups first)
-        sorted_groups = sorted(multi_groups.items(), key=lambda x: len(x[1]), reverse=True)
-        
-        # Process multi-response groups first
-        for base, group_cols in sorted_groups:
-            best_score = 0
-            best_match = None
-            
-            # Clean the base question for matching
-            clean_base = self.clean_column_name(base)
-            
-            # Find the best matching question
+        for base_question, group_cols in multi_groups.items():
+            clean_base = self.clean_column_name(base_question)
+            best_match_q = None
+            highest_score = 0.0
+
             for q in questions:
-                if q.number not in used_questions:
-                    score = self.calculate_similarity(clean_base, q.text)
-                    
-                    # Boost score if question has "select all that apply"
-                    if 'select all' in q.text.lower() and 'select all' in base.lower():
-                        score += 0.4
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = q.number
-            
-            # Assign same question number to all columns in group
-            if best_match and best_score > 0.3:  # Lower threshold for groups
-                for group_col in group_cols:
-                    mapping[group_col] = best_match
-                used_questions.add(best_match)
-                print(f"Mapped group '{base}' ({len(group_cols)} items) to Q{best_match}")
-        
-        # Second pass: Match remaining columns
-        for col in columns:
-            if col in mapping:
-                continue
+                if q.number in used_question_nums:
+                    continue
                 
-            best_score = 0
-            best_match = None
+                score = self.calculate_similarity(clean_base, q.text)
+                # Boost score for explicit multi-response questions
+                if q.question_type == 'multi':
+                    score += 0.2
+                
+                if score > highest_score:
+                    highest_score = score
+                    best_match_q = q
+            
+            if best_match_q and highest_score > similarity_threshold:
+                for col in group_cols:
+                    mapping[col] = best_match_q.number
+                used_question_nums.add(best_match_q.number)
+                # Remove these columns from the main list to avoid re-processing
+                columns = [c for c in columns if c not in group_cols]
+
+        # Second pass: Match remaining individual columns
+        for col in columns:
             clean_col = self.clean_column_name(col)
-            
+            best_match_q = None
+            highest_score = 0.0
+
             for q in questions:
-                if q.number not in used_questions:
-                    score = self.calculate_similarity(clean_col, q.text)
-                    
-                    # Boost score for demographic questions
-                    if int(q.number) >= 180:  # Demographic section
-                        for demo_type, patterns in self.demographic_patterns.items():
-                            if any(p in clean_col for p in patterns):
-                                score += 0.3
-                                break
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = q.number
+                if q.number in used_question_nums:
+                    continue
+                
+                score = self.calculate_similarity(clean_col, q.text)
+                
+                # Boost score for demographic questions based on keywords
+                is_demographic = any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns)
+                if is_demographic and any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
+                    score += 0.3
+                
+                if score > highest_score:
+                    highest_score = score
+                    best_match_q = q
             
-            if best_match and best_score > 0.4:  # Threshold
-                mapping[col] = best_match
-                # Only mark as used if high confidence
-                if best_score > 0.7:
-                    used_questions.add(best_match)
+            if best_match_q and highest_score > similarity_threshold:
+                mapping[col] = best_match_q.number
+                # Once a question is used, don't use it again to prevent duplicates.
+                used_question_nums.add(best_match_q.number)
             else:
                 mapping[col] = 'UNMATCHED'
-                    
-        return mapping
-    
-    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str = "Q{num}. ") -> pd.DataFrame:
-        """Apply the question numbers to the dataset with customizable prefix format"""
-        # Create new column names with question numbers
-        new_columns = []
-        
-        for col in df.columns:
-            if col in mapping and mapping[col] != 'UNMATCHED':
-                # Format the question number using the specified format
-                if str(mapping[col]).isdigit():  # Check if it's a number
-                    prefix = prefix_format.format(num=mapping[col])
-                    new_col = f"{prefix}{col}"
-                else:
-                    # For non-numeric mappings (META, ID, etc), don't add prefix
-                    new_col = col
-            else:
-                # Keep original name for unmatched columns
-                new_col = col
                 
-            new_columns.append(new_col)
-            
+        return mapping
+
+    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str) -> pd.DataFrame:
+        """Applies the new question numbers to the dataset's column headers."""
         df_numbered = df.copy()
-        df_numbered.columns = new_columns
+        new_columns = {}
         
+        for col in df_numbered.columns:
+            q_num = mapping.get(col, 'UNMATCHED')
+            if q_num not in ['UNMATCHED', 'META', 'ID', 'SKIP'] and str(q_num).isdigit():
+                prefix = prefix_format.format(num=q_num)
+                new_columns[col] = f"{prefix}{col}"
+            else:
+                new_columns[col] = col # Keep original name
+                
+        df_numbered.rename(columns=new_columns, inplace=True)
         return df_numbered
 
-# Streamlit UI
 def create_streamlit_app():
+    """Initializes and runs the Streamlit user interface."""
     st.set_page_config(page_title="Question Number Aligner", layout="wide")
     
     st.title("📊 Question Number Alignment Tool")
+    st.markdown("Match survey dataset columns to a PDF overview automatically. Upload your files, run the alignment, review the matches, and export your newly numbered dataset.")
     st.markdown("---")
-    
-    # Initialize session state
+
+    # Initialize session state variables
     if 'mapping' not in st.session_state:
         st.session_state.mapping = None
     if 'df' not in st.session_state:
         st.session_state.df = None
     if 'questions' not in st.session_state:
         st.session_state.questions = []
-    
-    # File upload section
+
+    aligner = QuestionNumberAligner()
+
+    # --- Step 1: File Upload ---
+    st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
-    
     with col1:
-        st.subheader("📁 Upload Dataset (CSV/Excel)")
-        data_file = st.file_uploader("Choose your dataset file", type=['csv', 'xlsx'])
-        
+        data_file = st.file_uploader("Upload Dataset (CSV/Excel)", type=['csv', 'xlsx'])
     with col2:
-        st.subheader("📄 Upload PDF Overview")
-        pdf_file = st.file_uploader("Choose your PDF file", type=['pdf'])
-        st.info("Note: For demo purposes, you can also paste the question list below")
-        
-    # Manual question input (for testing)
-    with st.expander("📝 Or paste question list here (for testing)"):
-        question_text = st.text_area(
-            "Paste questions in format: 'number. question text'",
+        pdf_file = st.file_uploader("Upload Survey PDF", type=['pdf'])
+
+    with st.expander("📝 Or, Paste Question List Manually"):
+        question_text_manual = st.text_area(
+            "Paste questions in 'number. question text' format, one per line:",
             height=200,
             placeholder="1. To which gender identity do you most identify?\n2. What is your age?\n..."
         )
-        
-    # Process files
+
+    # Process uploaded files
     if data_file:
-        # Load dataset
-        if data_file.name.endswith('.csv'):
-            st.session_state.df = pd.read_csv(data_file)
-        else:
-            st.session_state.df = pd.read_excel(data_file)
-            
-        st.success(f"✅ Dataset loaded: {len(st.session_state.df)} rows, {len(st.session_state.df.columns)} columns")
-        
-    # Initialize aligner
-    aligner = QuestionNumberAligner()
-    
-    # Parse questions (from PDF or manual input)
+        try:
+            if data_file.name.endswith('.csv'):
+                st.session_state.df = pd.read_csv(data_file)
+            else:
+                st.session_state.df = pd.read_excel(data_file)
+            st.success(f"✅ Dataset loaded: {len(st.session_state.df)} rows, {len(st.session_state.df.columns)} columns.")
+        except Exception as e:
+            st.error(f"Error loading dataset: {e}")
+            st.session_state.df = None
+
+    pdf_text_content = ""
     if pdf_file:
         try:
-            import pdfplumber
             with pdfplumber.open(pdf_file) as pdf:
-                pdf_text = ""
-                for page in pdf.pages:
-                    pdf_text += page.extract_text() + "\n"
-                
-                # Extract questions that start with numbers
-                import re
-                question_lines = []
-                for line in pdf_text.split('\n'):
-                    # Match lines that start with a number followed by a period
-                    # Stop at the question mark or end of line
-                    match = re.match(r'^(\d+)\.\s+([^?\n]+(?:\?)?)', line.strip())
-                    if match:
-                        # Get just the question part, not table headers
-                        question_text = match.group(0)
-                        # Clean up any trailing table data
-                        # Remove patterns like "5. Very" or "1. Not at all" that come from scale headers
-                        question_text = re.sub(r'\s+\d+\.\s+(Very|Somewhat|Neither|Not at all|Strongly).
-                                              
-    
-    # Run alignment
-    if st.session_state.df is not None and st.session_state.questions:
-        if st.button("🚀 Run Automatic Alignment", type="primary"):
-            with st.spinner("Analyzing and matching columns..."):
-                st.session_state.mapping = aligner.match_columns_to_questions(
-                    st.session_state.df, 
-                    st.session_state.questions
-                )
-                
-    # Display results
-    if st.session_state.mapping:
-        st.markdown("---")
-        st.subheader("📋 Alignment Results")
-        
-        # Create review dataframe - MAINTAIN ORIGINAL ORDER
-        review_data = []
-        # Use the original DataFrame columns to maintain order
-        for col in st.session_state.df.columns:
-            if col in st.session_state.mapping:
-                q_num = st.session_state.mapping[col]
-                # Determine status based on current mapping
-                if q_num == 'UNMATCHED':
-                    status = '❌ Unmatched'
-                elif q_num in ['META', 'ID', 'SKIP']:
-                    status = '⚪ Metadata/Skip'
-                elif str(q_num).isdigit():  # Convert to string for checking
-                    status = '✅ Matched'
-                else:
-                    status = '✏️ Manual'
-                    
-                review_data.append({
-                    'Column Name': col,  # Use EXACT original column name
-                    'Assigned Question': str(q_num),  # Convert to string
-                    'Status': status
-                })
-            
-        review_df = pd.DataFrame(review_data)
-        
-        # Summary metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            total_cols = len(review_df)
-            st.metric("Total Columns", total_cols)
-        with col2:
-            matched = len(review_df[review_df['Status'] == '✅ Matched'])
-            st.metric("Matched", matched, f"{matched/total_cols*100:.1f}%")
-        with col3:
-            unmatched = len(review_df[review_df['Status'] == '❌ Unmatched'])
-            st.metric("Unmatched", unmatched)
-            
-        # Filter options
-        filter_option = st.radio(
-            "Show:",
-            ["All", "Matched only", "Unmatched only"],
-            horizontal=True
-        )
-        
-        if filter_option == "Matched only":
-            display_df = review_df[review_df['Status'] == '✅ Matched']
-        elif filter_option == "Unmatched only":
-            display_df = review_df[review_df['Status'] == '❌ Unmatched']
-        else:
-            display_df = review_df
-            
-        # Editable dataframe for manual corrections
-        st.markdown("### Review and Edit Mappings")
-        
-        edited_df = st.data_editor(
-            display_df,
-            column_config={
-                "Column Name": st.column_config.TextColumn(
-                    "Column Name",
-                    help="Original column name from your dataset",
-                    width="large",  # Make column wider
-                    max_chars=500  # Allow long text
-                ),
-                "Assigned Question": st.column_config.TextColumn(
-                    "Assigned Question",
-                    help="Edit question numbers here",
-                    width="small",
-                ),
-                "Status": st.column_config.TextColumn(
-                    "Status",
-                    width="small"
-                )
-            },
-            num_rows="fixed",
-            use_container_width=True
-        )
-        
-        # Apply changes button
-        if st.button("✏️ Apply Manual Corrections"):
-            # Update mapping with edits
-            for _, row in edited_df.iterrows():
-                st.session_state.mapping[row['Column Name']] = row['Assigned Question']
-            st.success("✅ Manual corrections applied!")
-            
-            # Refresh the display to show updated statuses
-            st.rerun()
-            
-        # Export options
-        st.markdown("---")
-        st.subheader("💾 Export Options")
-        
-        # Add prefix format selector
-        col1, col2 = st.columns(2)
-        with col1:
-            prefix_format = st.selectbox(
-                "Question Number Format",
-                ["Q{num}. ", "{num}. ", "#{num}. ", "Question {num}: ", "Q{num} - ", "{num}) "],
-                help="Choose how question numbers appear in the export"
-            )
-            
-            # Show preview
-            st.caption(f"Preview: {prefix_format.format(num='1')}Your question text here")
-        
-        with col2:
-            # Add checkbox for including/excluding unmatched columns
-            include_unmatched = st.checkbox(
-                "Include unmatched columns in export", 
-                value=True,
-                help="Uncheck to exclude columns that couldn't be matched to questions"
-            )
-        
-        # Custom prefix option
-        use_custom = st.checkbox("Use custom format")
-        if use_custom:
-            custom_format = st.text_input(
-                "Custom format (use {num} for the question number)",
-                value="Q{num}. ",
-                help="Examples: 'Q{num}. ' or 'Question {num}: ' or '{num}) '"
-            )
-            prefix_format = custom_format
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("📊 Generate Numbered Dataset"):
-                # Apply numbering with custom prefix
-                numbered_df = aligner.apply_numbering_to_dataset(
-                    st.session_state.df, 
-                    st.session_state.mapping,
-                    prefix_format=prefix_format
-                )
-                
-                # Filter out unmatched columns if requested
-                if not include_unmatched:
-                    # Get columns that have valid question numbers
-                    matched_cols = [col for col in numbered_df.columns 
-                                  if not any(unmatch in col for unmatch in ['UNMATCHED', 'META', 'ID'])]
-                    numbered_df = numbered_df[matched_cols]
-                
-                # Offer both CSV and Excel options
-                st.markdown("##### Download Format:")
-                
-                # Excel download
-                import io
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    numbered_df.to_excel(writer, sheet_name='Sheet1', index=False)
-                excel_data = output.getvalue()
-                
-                st.download_button(
-                    label="📑 Download as Excel (.xlsx)",
-                    data=excel_data,
-                    file_name="numbered_dataset.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-                # CSV download with proper encoding
-                csv = numbered_df.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button(
-                    label="📄 Download as CSV (UTF-8)",
-                    data=csv,
-                    file_name="numbered_dataset.csv",
-                    mime="text/csv"
-                )
-                
-        with col2:
-            if st.button("📄 Export Mapping"):
-                mapping_df = pd.DataFrame(
-                    list(st.session_state.mapping.items()),
-                    columns=['Original Column', 'Question Number']
-                )
-                
-                # Offer both CSV and Excel options for mapping too
-                st.markdown("##### Download Format:")
-                
-                # Excel download
-                import io
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    mapping_df.to_excel(writer, sheet_name='Mapping', index=False)
-                excel_data = output.getvalue()
-                
-                st.download_button(
-                    label="📑 Download Mapping as Excel",
-                    data=excel_data,
-                    file_name="column_mapping.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-                # CSV with proper encoding
-                csv = mapping_df.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button(
-                    label="📄 Download Mapping as CSV",
-                    data=csv,
-                    file_name="column_mapping.csv",
-                    mime="text/csv"
-                )
-
-if __name__ == "__main__":
-    # Run with: streamlit run question_aligner.py
-    create_streamlit_app(), '', question_text)
-                        question_lines.append(question_text.strip())
-                
-                if question_lines:
-                    question_text = '\n'.join(question_lines)
-                    st.session_state.questions = aligner.parse_pdf_questions(question_text)
-                    st.success(f"✅ Extracted {len(st.session_state.questions)} questions from PDF")
-                    
-                    # Show extracted questions for review
-                    with st.expander("📋 Review extracted questions"):
-                        st.text(question_text)
-                else:
-                    st.warning("Could not find numbered questions in PDF. Please use manual input below.")
-                    
+                pdf_text_content = "\n".join(page.extract_text() for page in pdf.pages)
         except Exception as e:
-            st.error(f"Error reading PDF: {str(e)}")
-            st.info("Please install pdfplumber: pip install pdfplumber")
+            st.error(f"Error reading PDF: {e}")
     
-    elif question_text:
-        st.session_state.questions = aligner.parse_pdf_questions(question_text)
-        st.success(f"✅ Parsed {len(st.session_state.questions)} questions")
-    
-    # Run alignment
+    # Use manual text if provided, otherwise use PDF text
+    final_question_text = question_text_manual if question_text_manual else pdf_text_content
+    if final_question_text:
+        st.session_state.questions = aligner.parse_questions_from_text(final_question_text)
+        if st.session_state.questions:
+            st.success(f"✅ Parsed {len(st.session_state.questions)} questions.")
+            with st.expander("📋 Review Extracted Questions"):
+                st.json({q.number: q.text for q in st.session_state.questions})
+        else:
+            st.warning("Could not automatically parse questions. Please check the format or paste them manually.")
+
+    # --- Step 2: Run Alignment ---
+    st.markdown("---")
+    st.subheader("Step 2: Run Alignment")
     if st.session_state.df is not None and st.session_state.questions:
-        if st.button("🚀 Run Automatic Alignment", type="primary"):
-            with st.spinner("Analyzing and matching columns..."):
+        if st.button("🚀 Run Automatic Alignment", type="primary", use_container_width=True):
+            with st.spinner("Analyzing and matching columns... This may take a moment."):
                 st.session_state.mapping = aligner.match_columns_to_questions(
                     st.session_state.df, 
                     st.session_state.questions
                 )
-                
-    # Display results
+    else:
+        st.info("Please upload a dataset and provide questions to enable alignment.")
+
+    # --- Step 3: Review and Export ---
     if st.session_state.mapping:
         st.markdown("---")
-        st.subheader("📋 Alignment Results")
-        
-        # Create review dataframe - MAINTAIN ORIGINAL ORDER
+        st.subheader("Step 3: Review, Edit, and Export")
+
+        # Create a DataFrame for reviewing the mappings
         review_data = []
-        # Use the original DataFrame columns to maintain order
         for col in st.session_state.df.columns:
-            if col in st.session_state.mapping:
-                q_num = st.session_state.mapping[col]
-                # Determine status based on current mapping
-                if q_num == 'UNMATCHED':
-                    status = '❌ Unmatched'
-                elif q_num in ['META', 'ID', 'SKIP']:
-                    status = '⚪ Metadata/Skip'
-                elif q_num.isdigit():
-                    status = '✅ Matched'
-                else:
-                    status = '✏️ Manual'
-                    
-                review_data.append({
-                    'Column Name': col,  # Use original column name without modifications
-                    'Assigned Question': q_num,
-                    'Status': status
-                })
+            q_num = st.session_state.mapping.get(col, 'UNMATCHED')
             
-        review_df = pd.DataFrame(review_data)
+            status = '⚪ Manual'
+            if q_num == 'UNMATCHED':
+                status = '❌ Unmatched'
+            elif str(q_num).isdigit():
+                status = '✅ Matched'
+            
+            review_data.append({
+                'Column Name': col,
+                'Assigned Question': str(q_num), # Ensure it's a string for the editor
+                'Status': status
+            })
         
-        # Summary metrics
+        review_df = pd.DataFrame(review_data).set_index('Column Name')
+
+        # Display summary metrics
+        total_cols = len(review_df)
+        matched_count = (review_df['Status'] == '✅ Matched').sum()
+        unmatched_count = (review_df['Status'] == '❌ Unmatched').sum()
+        
         col1, col2, col3 = st.columns(3)
-        with col1:
-            total_cols = len(review_df)
-            st.metric("Total Columns", total_cols)
-        with col2:
-            matched = len(review_df[review_df['Status'] == '✅ Matched'])
-            st.metric("Matched", matched, f"{matched/total_cols*100:.1f}%")
-        with col3:
-            unmatched = len(review_df[review_df['Status'] == '❌ Unmatched'])
-            st.metric("Unmatched", unmatched)
-            
-        # Filter options
-        filter_option = st.radio(
-            "Show:",
-            ["All", "Matched only", "Unmatched only"],
-            horizontal=True
-        )
-        
-        if filter_option == "Matched only":
-            display_df = review_df[review_df['Status'] == '✅ Matched']
-        elif filter_option == "Unmatched only":
-            display_df = review_df[review_df['Status'] == '❌ Unmatched']
-        else:
-            display_df = review_df
-            
-        # Editable dataframe for manual corrections
-        st.markdown("### Review and Edit Mappings")
+        col1.metric("Total Columns", total_cols)
+        col2.metric("Automatically Matched", f"{matched_count}", f"{matched_count/total_cols*100:.1f}%")
+        col3.metric("Unmatched", f"{unmatched_count}")
+
+        # Editable table for corrections
+        st.markdown("##### Review and Edit Mappings")
+        st.info("You can edit the 'Assigned Question' column below. Change numbers or use labels like 'META' or 'SKIP'.")
         
         edited_df = st.data_editor(
-            display_df,
+            review_df,
             column_config={
-                "Column Name": st.column_config.TextColumn(
-                    "Column Name",
-                    help="Original column name from your dataset",
-                    width="large",  # Make column wider
-                    max_chars=500  # Allow long text
-                ),
-                "Assigned Question": st.column_config.TextColumn(
-                    "Assigned Question",
-                    help="Edit question numbers here",
-                    width="small",
-                ),
-                "Status": st.column_config.TextColumn(
-                    "Status",
-                    width="small"
-                )
+                "Assigned Question": st.column_config.TextColumn(help="Edit question numbers or add labels (e.g., 'META', 'SKIP')."),
+                "Status": st.column_config.TextColumn(help="Indicates the current match status.", disabled=True)
             },
-            num_rows="fixed",
-            use_container_width=True
+            use_container_width=True,
+            height=400
         )
-        
-        # Apply changes button
-        if st.button("✏️ Apply Manual Corrections"):
-            # Update mapping with edits
-            for _, row in edited_df.iterrows():
-                st.session_state.mapping[row['Column Name']] = row['Assigned Question']
-            st.success("✅ Manual corrections applied!")
-            
-            # Refresh the display to show updated statuses
-            st.rerun()
-            
+
+        # Update the main session state mapping from the editor's changes
+        for col_name, row in edited_df.iterrows():
+            st.session_state.mapping[col_name] = row['Assigned Question']
+
         # Export options
-        st.markdown("---")
-        st.subheader("💾 Export Options")
+        st.markdown("##### Export Your Renumbered Dataset")
         
-        # Add prefix format selector
-        col1, col2 = st.columns(2)
-        with col1:
+        export_cols = st.columns(2)
+        with export_cols[0]:
             prefix_format = st.selectbox(
                 "Question Number Format",
                 ["Q{num}. ", "{num}. ", "#{num}. ", "Question {num}: ", "Q{num} - ", "{num}) "],
-                help="Choose how question numbers appear in the export"
+                help="Choose how question numbers are prefixed to column names."
             )
-            
-            # Show preview
-            st.caption(f"Preview: {prefix_format.format(num='1')}Your question text here")
+        with export_cols[1]:
+            include_unmatched = st.checkbox("Include unmatched columns in export", value=True)
+
+        # Generate the final DataFrame for download
+        final_df = aligner.apply_numbering_to_dataset(
+            st.session_state.df, 
+            st.session_state.mapping, 
+            prefix_format=prefix_format
+        )
         
-        with col2:
-            # Add checkbox for including/excluding unmatched columns
-            include_unmatched = st.checkbox(
-                "Include unmatched columns in export", 
-                value=True,
-                help="Uncheck to exclude columns that couldn't be matched to questions"
+        # Filter out unmatched columns if requested
+        if not include_unmatched:
+            cols_to_keep = [
+                col for original_col, col in zip(st.session_state.df.columns, final_df.columns)
+                if st.session_state.mapping.get(original_col, 'UNMATCHED') != 'UNMATCHED'
+            ]
+            final_df = final_df[cols_to_keep]
+
+        # Prepare data for download buttons
+        csv_data = final_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8')
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            final_df.to_excel(writer, index=False, sheet_name='Numbered Data')
+        excel_data = output.getvalue()
+
+        dl_cols = st.columns(2)
+        with dl_cols[0]:
+            st.download_button(
+                label="📄 Download as CSV",
+                data=csv_data,
+                file_name="renumbered_dataset.csv",
+                mime="text/csv",
+                use_container_width=True
             )
-        
-        # Custom prefix option
-        use_custom = st.checkbox("Use custom format")
-        if use_custom:
-            custom_format = st.text_input(
-                "Custom format (use {num} for the question number)",
-                value="Q{num}. ",
-                help="Examples: 'Q{num}. ' or 'Question {num}: ' or '{num}) '"
+        with dl_cols[1]:
+            st.download_button(
+                label="📑 Download as Excel",
+                data=excel_data,
+                file_name="renumbered_dataset.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
             )
-            prefix_format = custom_format
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("📊 Generate Numbered Dataset"):
-                # Apply numbering with custom prefix
-                numbered_df = aligner.apply_numbering_to_dataset(
-                    st.session_state.df, 
-                    st.session_state.mapping,
-                    prefix_format=prefix_format
-                )
-                
-                # Filter out unmatched columns if requested
-                if not include_unmatched:
-                    # Get columns that have valid question numbers
-                    matched_cols = [col for col in numbered_df.columns 
-                                  if not any(unmatch in col for unmatch in ['UNMATCHED', 'META', 'ID'])]
-                    numbered_df = numbered_df[matched_cols]
-                
-                # Offer both CSV and Excel options
-                st.markdown("##### Download Format:")
-                
-                # Excel download
-                import io
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    numbered_df.to_excel(writer, sheet_name='Sheet1', index=False)
-                excel_data = output.getvalue()
-                
-                st.download_button(
-                    label="📑 Download as Excel (.xlsx)",
-                    data=excel_data,
-                    file_name="numbered_dataset.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-                # CSV download with proper encoding
-                csv = numbered_df.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button(
-                    label="📄 Download as CSV (UTF-8)",
-                    data=csv,
-                    file_name="numbered_dataset.csv",
-                    mime="text/csv"
-                )
-                
-        with col2:
-            if st.button("📄 Export Mapping"):
-                mapping_df = pd.DataFrame(
-                    list(st.session_state.mapping.items()),
-                    columns=['Original Column', 'Question Number']
-                )
-                
-                # Offer both CSV and Excel options for mapping too
-                st.markdown("##### Download Format:")
-                
-                # Excel download
-                import io
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    mapping_df.to_excel(writer, sheet_name='Mapping', index=False)
-                excel_data = output.getvalue()
-                
-                st.download_button(
-                    label="📑 Download Mapping as Excel",
-                    data=excel_data,
-                    file_name="column_mapping.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-                # CSV with proper encoding
-                csv = mapping_df.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button(
-                    label="📄 Download Mapping as CSV",
-                    data=csv,
-                    file_name="column_mapping.csv",
-                    mime="text/csv"
-                )
 
 if __name__ == "__main__":
-    # Run with: streamlit run question_aligner.py
     create_streamlit_app()
