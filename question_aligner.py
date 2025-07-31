@@ -44,8 +44,13 @@ class QuestionNumberAligner:
         """
         Sends a PDF file to the Gemini API to extract questions and returns them as a list of Question objects.
         """
-        # The API key is handled by the environment, so it can be left blank here.
-        api_key = ""
+        # Securely get the API key from Streamlit's secrets manager.
+        # The user must set this in their app's settings.
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        if not api_key:
+            st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
+            return []
+
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
         
         # Encode the PDF file bytes into base64.
