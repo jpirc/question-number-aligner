@@ -109,7 +109,9 @@ class QuestionNumberAligner:
             st.error("GEMINI_API_KEY is not set. Cannot perform AI matching.")
             return {}
 
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        # --- MODEL UPGRADE ---
+        # Switched to the more powerful 'pro' model to handle large inputs/outputs without truncation.
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
         # Prepare the data for the prompt
         question_dict = {q.number: q.text for q in questions}
@@ -144,7 +146,7 @@ class QuestionNumberAligner:
         }
 
         try:
-            with st.spinner("Calling Gemini API for intelligent matching..."):
+            with st.spinner("Calling Gemini 1.5 Pro for intelligent matching..."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
                 response.raise_for_status()
             
