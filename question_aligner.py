@@ -90,7 +90,6 @@ class QuestionNumberAligner:
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
                 response.raise_for_status()
                 
-            # Log the raw response for debugging
             response_json = response.json()
             
             with st.expander("🔍 API Response Details (for debugging)"):
@@ -100,17 +99,15 @@ class QuestionNumberAligner:
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
             extracted_json_text = content_part.get('text', '{}')
             
-            # Log the extracted JSON
             with st.expander("📝 Extracted Questions JSON"):
                 st.code(extracted_json_text, language='json')
             
             question_dict = json.loads(extracted_json_text)
             
-            # Log question count
             st.info(f"📊 Extracted {len(question_dict)} questions from the PDF")
             
             questions = [Question(number=str(num), text=text, question_type=self._determine_question_type(text)) 
-                        for num, text in question_dict.items()]
+                         for num, text in question_dict.items()]
             return sorted(questions, key=lambda q: int(q.number))
 
         except requests.exceptions.RequestException as e:
@@ -163,13 +160,10 @@ class QuestionNumberAligner:
         mapping = {}
         confidence_scores = {}
         
-        # Sort questions by number for order-based matching
         sorted_questions = sorted(questions, key=lambda q: int(q.number))
         
-        # Don't track used questions - allow reuse for repeated questions (ad variants)
         multi_groups = self.find_multi_response_groups(columns)
         
-        # Process multi-response groups
         for base_question, group_cols in multi_groups.items():
             clean_base = self.clean_column_name(base_question)
             best_match_q, highest_score = None, 0.0
@@ -186,7 +180,6 @@ class QuestionNumberAligner:
                     mapping[col] = best_match_q.number
                     confidence_scores[col] = highest_score
 
-        # Process remaining columns with order consideration
         unmapped_columns = [col for col in columns if col not in mapping]
         question_index = 0
         
@@ -195,17 +188,13 @@ class QuestionNumberAligner:
             best_match_q, highest_score = None, 0.0
             best_q_idx = -1
             
-            # Start searching from where we left off in the question list
             for q_idx, q in enumerate(sorted_questions[question_index:], start=question_index):
                 score = self.calculate_similarity(clean_col, q.text)
                 
-                # Boost score for demographic matches
                 if any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns) and \
                    any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
                     score += 0.3
                 
-                # Add proximity bonus - questions closer to expected position get a boost
-                # This helps when column text is generic (like in monadic surveys)
                 proximity_bonus = max(0, 1 - abs(q_idx - question_index) / len(sorted_questions)) * 0.2
                 score += proximity_bonus
                     
@@ -213,7 +202,6 @@ class QuestionNumberAligner:
                     highest_score, best_match_q = score, q
                     best_q_idx = q_idx
             
-            # Also check earlier questions in case of repeats
             for q_idx, q in enumerate(sorted_questions[:question_index]):
                 score = self.calculate_similarity(clean_col, q.text)
                 
@@ -228,7 +216,6 @@ class QuestionNumberAligner:
             if best_match_q and highest_score > 0.4:
                 mapping[col] = best_match_q.number
                 confidence_scores[col] = highest_score
-                # Update our position in the question list for order-based matching
                 if best_q_idx >= question_index:
                     question_index = best_q_idx
             else:
@@ -242,11 +229,9 @@ class QuestionNumberAligner:
         df_numbered = df.copy()
         
         if not include_unmatched:
-            # Filter out unmatched columns
             matched_cols = [col for col in df.columns if mapping.get(col, 'UNMATCHED') != 'UNMATCHED']
             df_numbered = df_numbered[matched_cols]
         
-        # Rename columns with question numbers
         new_columns = {}
         for col in df_numbered.columns:
             if col in mapping and mapping[col] != 'UNMATCHED' and mapping[col].isdigit():
@@ -265,7 +250,6 @@ def create_streamlit_app():
     st.markdown("This tool uses AI to read a survey PDF, extract the questions, and match them to your dataset columns.")
     st.markdown("---")
 
-    # Initialize session state
     if 'mapping' not in st.session_state: st.session_state.mapping = None
     if 'confidence_scores' not in st.session_state: st.session_state.confidence_scores = None
     if 'df' not in st.session_state: st.session_state.df = None
@@ -273,7 +257,6 @@ def create_streamlit_app():
     
     aligner = QuestionNumberAligner()
 
-    # Step 1: File Upload
     st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
     with col1:
@@ -289,7 +272,6 @@ def create_streamlit_app():
             st.error(f"Error loading dataset: {e}")
             st.session_state.df = None
 
-    # Load Previous Mapping Option
     with st.expander("📂 Load Previous Mapping (Optional)"):
         uploaded_mapping = st.file_uploader("Load a saved mapping file", type=['json'])
         if uploaded_mapping:
@@ -300,11 +282,9 @@ def create_streamlit_app():
             except Exception as e:
                 st.error(f"Error loading mapping: {e}")
 
-    # Step 2: Extract Questions
     st.markdown("---")
     st.subheader("Step 2: Extract Questions from PDF")
     
-    # Add tabs for different input methods
     tab1, tab2 = st.tabs(["🤖 AI Extraction", "✏️ Manual Entry"])
     
     with tab1:
@@ -350,7 +330,6 @@ Option 2 - Simple list:
         if st.button("📝 Process Manual Questions", use_container_width=True):
             if manual_questions.strip():
                 try:
-                    # Try JSON format first
                     if manual_questions.strip().startswith('{'):
                         question_dict = json.loads(manual_questions)
                         st.session_state.questions = [
@@ -358,7 +337,6 @@ Option 2 - Simple list:
                             for num, text in question_dict.items()
                         ]
                     else:
-                        # Parse as numbered list
                         questions = []
                         for line in manual_questions.strip().split('\n'):
                             match = re.match(r'^(\d+)\.\s+(.+)', line.strip())
@@ -383,64 +361,53 @@ Option 2 - Simple list:
 
     if st.session_state.questions:
         with st.expander(f"📋 Review Extracted Questions ({len(st.session_state.questions)} total)"):
-            # Show questions in a more readable format
             questions_df = pd.DataFrame([
                 {"Number": q.number, "Text": q.text, "Type": q.question_type}
                 for q in sorted(st.session_state.questions, key=lambda x: int(x.number))
             ])
             st.dataframe(questions_df, use_container_width=True, height=400)
             
-            # Also provide JSON for easy copying
             st.markdown("##### JSON Format (for reuse):")
             question_dict = {q.number: q.text for q in st.session_state.questions}
             st.code(json.dumps(question_dict, indent=2), language='json')
 
-    # Step 3: Run Alignment
     if st.session_state.df is not None and st.session_state.questions:
         st.markdown("---")
         st.subheader("Step 3: Run Alignment")
         if st.button("🚀 Run Automatic Alignment", use_container_width=True):
             with st.spinner("Analyzing and matching columns..."):
+                # **FIX IS HERE:** Unpack the tuple into two separate variables first.
                 mapping, confidence_scores = aligner.match_columns_to_questions(st.session_state.df, st.session_state.questions)
+                # **THEN,** assign each variable to the session state.
                 st.session_state.mapping = mapping
                 st.session_state.confidence_scores = confidence_scores
     
-    # Display Results
     if st.session_state.mapping:
         st.markdown("---")
         st.subheader("📋 Alignment Results")
         
-        # Create question lookup and dropdown options
         question_lookup = {q.number: q.text for q in st.session_state.questions}
         
-        # Create dropdown options: "Qnum. Question text" format
         question_options = ['UNMATCHED'] + [f"Q{num}. {text}" for num, text in sorted(question_lookup.items(), key=lambda x: int(x[0]))]
         
-        # Summary metrics
         total_cols = len(st.session_state.df.columns)
         matched_cols = sum(1 for v in st.session_state.mapping.values() if v != 'UNMATCHED')
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Columns", total_cols)
-        with col2:
-            st.metric("Matched", matched_cols, f"{matched_cols/total_cols*100:.1f}%")
-        with col3:
-            st.metric("Unmatched", total_cols - matched_cols)
+        with col1: st.metric("Total Columns", total_cols)
+        with col2: st.metric("Matched", matched_cols, f"{matched_cols/total_cols*100:.1f}%")
+        with col3: st.metric("Unmatched", total_cols - matched_cols)
         
         st.markdown("##### Review and Edit Mappings")
         st.info("💡 Tip: Make all your changes, then click 'Confirm Changes' to update the mapping.")
         
-        # Initialize temporary mapping if not exists
         if 'temp_mapping' not in st.session_state:
             st.session_state.temp_mapping = st.session_state.mapping.copy()
         
-        # Create review dataframe
         review_data = []
         for col in st.session_state.df.columns:
             q_num = st.session_state.temp_mapping.get(col, 'UNMATCHED')
             confidence = st.session_state.confidence_scores.get(col, 0.0)
             
-            # Create current selection for dropdown
             if q_num != 'UNMATCHED':
                 current_selection = f"Q{q_num}. {question_lookup.get(q_num, 'Text not found')}"
             else:
@@ -455,7 +422,6 @@ Option 2 - Simple list:
         
         review_df = pd.DataFrame(review_data)
         
-        # Use column configuration for better display
         edited_df = st.data_editor(
             review_df,
             column_config={
@@ -475,21 +441,17 @@ Option 2 - Simple list:
             key="editor"
         )
         
-        # Confirm changes button
         col1, col2, col3 = st.columns([1, 1, 3])
         with col1:
             if st.button("✅ Confirm Changes", type="primary", use_container_width=True):
-                # Update mapping based on edits
                 for idx, row in edited_df.iterrows():
                     selection = row['Select Question']
                     if selection == 'UNMATCHED':
-                        st.session_state.mapping[row['Column Name']] = 'UNMATCHED'
-                        st.session_state.temp_mapping[row['Column Name']] = 'UNMATCHED'
+                        q_num = 'UNMATCHED'
                     else:
-                        # Extract question number from selection (format: "Q123. Question text")
                         q_num = selection.split('.')[0].replace('Q', '')
-                        st.session_state.mapping[row['Column Name']] = q_num
-                        st.session_state.temp_mapping[row['Column Name']] = q_num
+                    st.session_state.mapping[row['Column Name']] = q_num
+                    st.session_state.temp_mapping[row['Column Name']] = q_num
                 st.success("✅ Changes confirmed and mapping updated!")
                 
         with col2:
@@ -497,7 +459,6 @@ Option 2 - Simple list:
                 st.session_state.temp_mapping = st.session_state.mapping.copy()
                 st.rerun()
         
-        # Export section
         st.markdown("---")
         st.subheader("📥 Export Options")
         
@@ -511,7 +472,6 @@ Option 2 - Simple list:
         with col2:
             include_unmatched = st.checkbox("Include unmatched columns", value=True)
         
-        # Generate final dataset
         final_df = aligner.apply_numbering_to_dataset(
             st.session_state.df, 
             st.session_state.mapping, 
@@ -519,16 +479,13 @@ Option 2 - Simple list:
             include_unmatched
         )
         
-        # Export buttons
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            # Excel export
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 final_df.to_excel(writer, index=False, sheet_name='Numbered Data')
             excel_data = output.getvalue()
-
             st.download_button(
                 label="📑 Download Excel",
                 data=excel_data,
@@ -538,7 +495,6 @@ Option 2 - Simple list:
             )
         
         with col2:
-            # CSV export
             csv = final_df.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(
                 label="📄 Download CSV",
@@ -549,7 +505,6 @@ Option 2 - Simple list:
             )
         
         with col3:
-            # Save mapping
             mapping_json = json.dumps(st.session_state.mapping, indent=2)
             st.download_button(
                 label="💾 Save Mapping",
