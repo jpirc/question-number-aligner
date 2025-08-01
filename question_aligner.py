@@ -26,6 +26,24 @@ def index_to_excel_col(idx: int) -> str:
         idx = idx // 26 - 1
     return col
 
+def sanitize_json_string(json_str: str) -> str:
+    """
+    Attempts to clean up a potentially malformed JSON string from an LLM.
+    - Slices the string to the first '{' and last '}'
+    - Removes trailing commas that cause parsing errors
+    """
+    try:
+        start = json_str.find('{')
+        end = json_str.rfind('}')
+        if start == -1 or end == -1:
+            return "" 
+        
+        json_str = json_str[start:end+1]
+        json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
+        return json_str
+    except Exception:
+        return ""
+
 # --- Core Logic Class ---
 class QuestionNumberAligner:
     """Handles the logic for parsing and matching questions using the Gemini AI."""
@@ -159,6 +177,7 @@ class QuestionNumberAligner:
             ]
         }
         
+        extracted_json_text = ""
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
             response.raise_for_status()
@@ -170,13 +189,17 @@ class QuestionNumberAligner:
 
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
-            extracted_json_text = content_part.get('text', '{}').strip()
+            extracted_json_text = content_part.get('text', '').strip()
             
-            if not extracted_json_text.startswith('{') or not extracted_json_text.endswith('}'):
-                st.error(f"Error: AI response for a batch was truncated or not valid JSON.")
+            # **NEW**: Sanitize the JSON string before parsing
+            cleaned_json_text = sanitize_json_string(extracted_json_text)
+            
+            if not cleaned_json_text:
+                st.error(f"Error: AI response for a batch was malformed and could not be sanitized.")
+                st.text_area("Raw Malformed Response", value=extracted_json_text, height=150)
                 return {}
 
-            match_results = json.loads(extracted_json_text)
+            match_results = json.loads(cleaned_json_text)
             return match_results.get('mapping', {})
 
         except requests.exceptions.RequestException as e:
@@ -184,6 +207,7 @@ class QuestionNumberAligner:
             return {}
         except json.JSONDecodeError as e:
             st.error(f"Error parsing AI response for a batch. Error: {e}")
+            st.text_area("Raw AI Response That Failed Parsing", value=extracted_json_text, height=200)
             return {}
         except Exception as e:
             st.error(f"An unexpected error occurred during a batch match: {e}")
@@ -203,7 +227,6 @@ class QuestionNumberAligner:
             end_index = start_index + batch_size
             batch_headers = column_headers[start_index:end_index]
             
-            # Create a dictionary for the batch {original_index: header}
             column_batch_dict = {start_index + j: header for j, header in enumerate(batch_headers)}
 
             progress_text = f"Processing batch {i+1} of {num_batches} (Columns {start_index}-{end_index-1})..."
@@ -214,10 +237,10 @@ class QuestionNumberAligner:
             if not batch_mapping:
                 st.error(f"Batch {i+1} failed. Stopping process. Please review errors.")
                 progress_bar.empty()
-                return {} # Stop processing if a batch fails
+                return {}
 
             full_mapping.update(batch_mapping)
-            time.sleep(1) # Small delay to avoid hitting API rate limits
+            time.sleep(1)
 
         progress_bar.progress(1.0, text="Batch processing complete!")
         time.sleep(1)
@@ -300,11 +323,9 @@ def create_streamlit_app():
                 st.success(f"✅ AI successfully extracted {len(questions)} questions.")
                 
                 column_headers = st.session_state.original_df.columns.tolist()
-                # MODIFIED: Call the new batch processing function
                 match_results_dict = aligner.match_with_gemini_in_batches(questions, column_headers)
 
                 if match_results_dict:
-                    # --- PYTHON-SIDE RECONSTRUCTION (No changes needed here) ---
                     reconstructed_list = []
                     for i, header in enumerate(column_headers):
                         mapping_info = match_results_dict.get(str(i), {
