@@ -175,7 +175,7 @@ class QuestionNumberAligner:
                 if score > highest_score:
                     highest_score, best_match_q = score, q
                     
-            if best_match_q and highest_score > 0.3:
+            if best_match_q and highest_score > 0.6: # Stricter threshold
                 for col in group_cols:
                     mapping[col] = best_match_q.number
                     confidence_scores[col] = highest_score
@@ -188,6 +188,7 @@ class QuestionNumberAligner:
             best_match_q, highest_score = None, 0.0
             best_q_idx = -1
             
+            # Search forward first
             for q_idx, q in enumerate(sorted_questions[question_index:], start=question_index):
                 score = self.calculate_similarity(clean_col, q.text)
                 
@@ -195,13 +196,15 @@ class QuestionNumberAligner:
                    any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
                     score += 0.3
                 
-                proximity_bonus = max(0, 1 - abs(q_idx - question_index) / len(sorted_questions)) * 0.2
+                # Stronger proximity bonus for ordered matching
+                proximity_bonus = max(0, 1 - abs(q_idx - question_index) / 10) * 0.25 
                 score += proximity_bonus
                     
                 if score > highest_score:
                     highest_score, best_match_q = score, q
                     best_q_idx = q_idx
             
+            # Check earlier questions for repeats, but with no proximity bonus
             for q_idx, q in enumerate(sorted_questions[:question_index]):
                 score = self.calculate_similarity(clean_col, q.text)
                 
@@ -213,11 +216,11 @@ class QuestionNumberAligner:
                     highest_score, best_match_q = score, q
                     best_q_idx = q_idx
                     
-            if best_match_q and highest_score > 0.4:
+            if best_match_q and highest_score > 0.6: # Stricter threshold
                 mapping[col] = best_match_q.number
                 confidence_scores[col] = highest_score
                 if best_q_idx >= question_index:
-                    question_index = best_q_idx
+                    question_index = best_q_idx + 1 # Move to the next question
             else:
                 mapping[col] = 'UNMATCHED'
                 confidence_scores[col] = 0.0
@@ -376,9 +379,7 @@ Option 2 - Simple list:
         st.subheader("Step 3: Run Alignment")
         if st.button("🚀 Run Automatic Alignment", use_container_width=True):
             with st.spinner("Analyzing and matching columns..."):
-                # **FIX IS HERE:** Unpack the tuple into two separate variables first.
                 mapping, confidence_scores = aligner.match_columns_to_questions(st.session_state.df, st.session_state.questions)
-                # **THEN,** assign each variable to the session state.
                 st.session_state.mapping = mapping
                 st.session_state.confidence_scores = confidence_scores
     
@@ -387,14 +388,13 @@ Option 2 - Simple list:
         st.subheader("📋 Alignment Results")
         
         question_lookup = {q.number: q.text for q in st.session_state.questions}
-        
         question_options = ['UNMATCHED'] + [f"Q{num}. {text}" for num, text in sorted(question_lookup.items(), key=lambda x: int(x[0]))]
         
         total_cols = len(st.session_state.df.columns)
         matched_cols = sum(1 for v in st.session_state.mapping.values() if v != 'UNMATCHED')
         col1, col2, col3 = st.columns(3)
         with col1: st.metric("Total Columns", total_cols)
-        with col2: st.metric("Matched", matched_cols, f"{matched_cols/total_cols*100:.1f}%")
+        with col2: st.metric("Matched", matched_cols, f"{matched_cols/total_cols*100:.1f}%" if total_cols > 0 else "0.0%")
         with col3: st.metric("Unmatched", total_cols - matched_cols)
         
         st.markdown("##### Review and Edit Mappings")
@@ -404,7 +404,7 @@ Option 2 - Simple list:
             st.session_state.temp_mapping = st.session_state.mapping.copy()
         
         review_data = []
-        for col in st.session_state.df.columns:
+        for i, col in enumerate(st.session_state.df.columns):
             q_num = st.session_state.temp_mapping.get(col, 'UNMATCHED')
             confidence = st.session_state.confidence_scores.get(col, 0.0)
             
@@ -414,6 +414,7 @@ Option 2 - Simple list:
                 current_selection = 'UNMATCHED'
             
             review_data.append({
+                'Column #': i + 1,
                 'Column Name': col,
                 'Current Match': current_selection,
                 'Confidence': confidence,
@@ -425,6 +426,7 @@ Option 2 - Simple list:
         edited_df = st.data_editor(
             review_df,
             column_config={
+                "Column #": st.column_config.NumberColumn("Col #", disabled=True),
                 "Column Name": st.column_config.TextColumn("Column Name", width="large", disabled=True),
                 "Current Match": st.column_config.TextColumn("Current Match", width="large", disabled=True),
                 "Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1, format="%.0%"),
