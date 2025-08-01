@@ -155,7 +155,7 @@ class QuestionNumberAligner:
         return groups
 
     def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Tuple[Dict[str, str], Dict[str, float]]:
-        """Returns both mapping and confidence scores"""
+        """Returns both mapping and confidence scores with improved sequential logic."""
         columns = list(df.columns)
         mapping = {}
         confidence_scores = {}
@@ -175,7 +175,7 @@ class QuestionNumberAligner:
                 if score > highest_score:
                     highest_score, best_match_q = score, q
                     
-            if best_match_q and highest_score > 0.6: # Stricter threshold
+            if best_match_q and highest_score > 0.7: # **Stricter 70% threshold**
                 for col in group_cols:
                     mapping[col] = best_match_q.number
                     confidence_scores[col] = highest_score
@@ -188,39 +188,29 @@ class QuestionNumberAligner:
             best_match_q, highest_score = None, 0.0
             best_q_idx = -1
             
-            # Search forward first
-            for q_idx, q in enumerate(sorted_questions[question_index:], start=question_index):
+            # **Enhanced Sequential Logic**: Search forward from the last known good match
+            # This creates a "search window" that moves along with the columns.
+            search_window = sorted_questions[question_index:]
+            
+            for q_idx, q in enumerate(search_window):
+                actual_q_idx = question_index + q_idx
                 score = self.calculate_similarity(clean_col, q.text)
                 
-                if any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns) and \
-                   any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
-                    score += 0.3
-                
-                # Stronger proximity bonus for ordered matching
-                proximity_bonus = max(0, 1 - abs(q_idx - question_index) / 10) * 0.25 
+                # Proximity bonus is now more impactful and focused on the immediate next questions
+                distance = q_idx # Distance from the start of our search window
+                proximity_bonus = max(0, 1 - (distance / 15)) * 0.3 # Strong bonus for the next ~15 questions
                 score += proximity_bonus
                     
                 if score > highest_score:
                     highest_score, best_match_q = score, q
-                    best_q_idx = q_idx
+                    best_q_idx = actual_q_idx
             
-            # Check earlier questions for repeats, but with no proximity bonus
-            for q_idx, q in enumerate(sorted_questions[:question_index]):
-                score = self.calculate_similarity(clean_col, q.text)
-                
-                if any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns) and \
-                   any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
-                    score += 0.3
-                    
-                if score > highest_score:
-                    highest_score, best_match_q = score, q
-                    best_q_idx = q_idx
-                    
-            if best_match_q and highest_score > 0.6: # Stricter threshold
+            # **Stricter 70% threshold for single columns**
+            if best_match_q and highest_score > 0.7:
                 mapping[col] = best_match_q.number
                 confidence_scores[col] = highest_score
-                if best_q_idx >= question_index:
-                    question_index = best_q_idx + 1 # Move to the next question
+                # **Crucially, advance the index to prevent jumping backwards**
+                question_index = best_q_idx + 1
             else:
                 mapping[col] = 'UNMATCHED'
                 confidence_scores[col] = 0.0
