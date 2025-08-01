@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import streamlit as st
 import io
 import os
-from collections import defaultdict
+import time
 
 # --- Data Classes ---
 @dataclass
@@ -49,14 +49,12 @@ class QuestionNumberAligner:
         
         prompt = """
         You are a highly specialized text extraction tool. Your ONLY function is to scan the provided PDF and find every instance of a line that begins with a question number (e.g., "1.", "Q2.", "3.").
-
         Follow these steps:
         1. Read the entire document page by page.
         2. Identify every piece of text that appears to be a numbered survey question.
         3. For each match, capture the question number and the complete question text that follows. The question text ends when you encounter a chart, a data table, or the start of the next numbered question.
         4. Clean the extracted text to form a single, coherent sentence. Remove any line breaks or formatting noise.
         5. Assemble the results into a single, valid JSON object. The object should contain one key, "questions", which holds an array of objects. Each object in the array must have two keys: "question_number" (as a string) and "question_text" (the cleaned text).
-
         Example of a perfect response:
         {
           "questions": [
@@ -64,7 +62,6 @@ class QuestionNumberAligner:
             { "question_number": "40", "question_text": "HOH BDAY - Which one of the two taglines do you like the most for this campaign?" }
           ]
         }
-
         Find every single question. Do not skip any. The output must be only the JSON object.
         """
         
@@ -112,47 +109,43 @@ class QuestionNumberAligner:
             st.error(f"An unexpected error occurred during AI Question Extraction: {e}")
             return []
 
-    def match_with_gemini(self, questions: List[Question], column_headers: List[str]) -> Dict[str, Dict[str, str]]:
-        """
-        Uses Gemini 1.5 Pro with a simplified, robust prompt to match columns to questions.
-        Returns a dictionary mapping column index to its match info.
-        """
+    def _match_batch_with_gemini(self, questions: List[Question], column_batch: Dict[int, str]) -> Dict[str, Any]:
+        """Processes a single batch of columns against the full list of questions."""
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions])
-        # Send all column headers for the AI to analyze contextually
-        formatted_columns = "\n".join([f'{i}: "{header}"' for i, header in enumerate(column_headers)])
+        formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
 
         prompt = f"""
-        You are an expert market research data analyst. Your task is to map dataset columns to survey questions.
+        You are an expert market research data analyst. Your task is to map a batch of dataset columns to a full list of survey questions.
 
         **CRITICAL INSTRUCTIONS:**
         1.  **Accuracy is Mandatory:** If not highly confident, assign "UNMATCHED".
         2.  **Handle Multi-Part Questions:** Look at the column headers. If multiple columns clearly belong to the same question (e.g., "Q5 - Option A", "Q5 - Option B"), you MUST assign the SAME question number to all of them.
         3.  **No Forced Matches:** Assign "UNMATCHED" to system variables (e.g., 'Response ID').
-        4.  **Output Format:** Your response MUST be a single JSON object with one key, "mapping". The value is another object where each key is a `column_index` (as a string) and the value is an object with two keys: "assigned_question" and "reasoning".
-        5.  **Assigned Question VALUE:** For the "assigned_question" key, you MUST return ONLY the question number (e.g., "1", "3", "42a") or the literal string "UNMATCHED". DO NOT return the full question text.
+        4.  **Output Format:** Your response MUST be a single JSON object with one key, "mapping". The value is another object where each key is a `column_index` from the input batch (as a string) and the value is an object with two keys: "assigned_question" and "reasoning".
+        5.  **Assigned Question VALUE:** For the "assigned_question" key, you MUST return ONLY the question number (e.g., "1", "3", "42a") or the literal string "UNMATCHED".
 
-        Example Response Snippet:
+        Example Response Snippet for a batch:
         {{
           "mapping": {{
-            "0": {{"assigned_question": "UNMATCHED", "reasoning": "System variable."}},
-            "1": {{"assigned_question": "1", "reasoning": "Matches question about gender identity."}},
-            "2": {{"assigned_question": "1", "reasoning": "Specify option for question 1."}}
+            "150": {{"assigned_question": "UNMATCHED", "reasoning": "System variable."}},
+            "151": {{"assigned_question": "25", "reasoning": "Matches question about social media usage."}},
+            "152": {{"assigned_question": "25", "reasoning": "Option for question 25."}}
           }}
         }}
 
         ---
         **INPUT DATA**
-        1. Survey Questions (Number: Text):
+        1. Full Survey Questions List (Number: Text):
         {compact_questions}
 
-        2. Dataset Column Headers (Index: Header):
+        2. Batch of Dataset Column Headers to Map (Index: Header):
         {formatted_columns}
         ---
         **YOUR TASK**
-        Analyze all inputs and generate the JSON output mapping ALL original column indices to their corresponding question number.
+        Analyze the inputs and generate the JSON output mapping ALL column indices in the provided batch to their corresponding question number.
         """
 
         payload = {
@@ -167,14 +160,12 @@ class QuestionNumberAligner:
         }
         
         try:
-            with st.spinner("AI is matching questions to columns (Simplified, Robust Method)... This may take a moment."):
-                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-                response.raise_for_status()
+            response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+            response.raise_for_status()
             response_json = response.json()
 
             if not response_json.get('candidates'):
-                st.error("AI Matching Failed: The API returned no candidates. This is likely due to the prompt being blocked by safety filters.")
-                st.json(response_json)
+                st.error(f"AI Matching Failed for a batch: The API returned no candidates. This is likely due to the prompt being blocked by safety filters.")
                 return {}
 
             candidate = response_json.get('candidates', [{}])[0]
@@ -182,23 +173,56 @@ class QuestionNumberAligner:
             extracted_json_text = content_part.get('text', '{}').strip()
             
             if not extracted_json_text.startswith('{') or not extracted_json_text.endswith('}'):
-                st.error("Error: AI response for column matching was truncated or not valid JSON.")
-                st.text_area("Invalid AI Response Snippet", value=extracted_json_text[:1000], height=150)
+                st.error(f"Error: AI response for a batch was truncated or not valid JSON.")
                 return {}
 
             match_results = json.loads(extracted_json_text)
             return match_results.get('mapping', {})
 
         except requests.exceptions.RequestException as e:
-            st.error(f"A network error occurred during AI matching: {e}")
+            st.error(f"A network error occurred during a batch match: {e}")
             return {}
         except json.JSONDecodeError as e:
-            st.error(f"Error parsing AI response for column matching. The response was not valid JSON. Error: {e}")
-            st.text_area("Raw AI Response", value=extracted_json_text, height=200)
+            st.error(f"Error parsing AI response for a batch. Error: {e}")
             return {}
         except Exception as e:
-            st.error(f"An unexpected error occurred during AI Matching: {e}")
+            st.error(f"An unexpected error occurred during a batch match: {e}")
             return {}
+
+    def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = 150) -> Dict[str, Dict[str, str]]:
+        """
+        Orchestrates the matching process by splitting columns into batches
+        and calling the AI for each batch.
+        """
+        full_mapping = {}
+        num_batches = (len(column_headers) + batch_size - 1) // batch_size
+        progress_bar = st.progress(0, text="Starting batch processing...")
+
+        for i in range(num_batches):
+            start_index = i * batch_size
+            end_index = start_index + batch_size
+            batch_headers = column_headers[start_index:end_index]
+            
+            # Create a dictionary for the batch {original_index: header}
+            column_batch_dict = {start_index + j: header for j, header in enumerate(batch_headers)}
+
+            progress_text = f"Processing batch {i+1} of {num_batches} (Columns {start_index}-{end_index-1})..."
+            progress_bar.progress((i) / num_batches, text=progress_text)
+            
+            batch_mapping = self._match_batch_with_gemini(questions, column_batch_dict)
+            
+            if not batch_mapping:
+                st.error(f"Batch {i+1} failed. Stopping process. Please review errors.")
+                progress_bar.empty()
+                return {} # Stop processing if a batch fails
+
+            full_mapping.update(batch_mapping)
+            time.sleep(1) # Small delay to avoid hitting API rate limits
+
+        progress_bar.progress(1.0, text="Batch processing complete!")
+        time.sleep(1)
+        progress_bar.empty()
+        return full_mapping
 
     def apply_numbering_to_dataset(self, df: pd.DataFrame, final_mapping_df: pd.DataFrame, prefix_format: str, include_unmatched: bool) -> pd.DataFrame:
         """Applies the final numbering to the dataset based on the review table."""
@@ -276,10 +300,11 @@ def create_streamlit_app():
                 st.success(f"✅ AI successfully extracted {len(questions)} questions.")
                 
                 column_headers = st.session_state.original_df.columns.tolist()
-                match_results_dict = aligner.match_with_gemini(questions, column_headers)
+                # MODIFIED: Call the new batch processing function
+                match_results_dict = aligner.match_with_gemini_in_batches(questions, column_headers)
 
                 if match_results_dict:
-                    # --- PYTHON-SIDE RECONSTRUCTION ---
+                    # --- PYTHON-SIDE RECONSTRUCTION (No changes needed here) ---
                     reconstructed_list = []
                     for i, header in enumerate(column_headers):
                         mapping_info = match_results_dict.get(str(i), {
@@ -304,7 +329,7 @@ def create_streamlit_app():
                     st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
                     st.success("✅ AI matching complete!")
                 else:
-                    st.error("AI matching failed to produce results. Please check the errors above.")
+                    st.error("AI batch matching failed to produce results. Please check the errors above.")
                     st.session_state.review_df = None
             else:
                 st.error("AI question extraction failed. Cannot proceed with matching.")
