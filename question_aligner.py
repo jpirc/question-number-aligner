@@ -102,7 +102,7 @@ class QuestionNumberAligner:
             return []
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             st.error(f"Error parsing AI response for question extraction. The response may be malformed. Error: {e}")
-            st.text_area("Raw AI Response", value=response.text, height=200)
+            st.text_area("Raw AI Response", value=response.text if 'response' in locals() else "No response object.", height=200)
             return []
         except Exception as e:
             st.error(f"An unexpected error occurred during AI Question Extraction: {e}")
@@ -111,11 +111,11 @@ class QuestionNumberAligner:
     def match_with_gemini(self, questions: List[Question], column_headers: List[str]) -> List[Dict[str, Any]]:
         """
         Uses Gemini 1.5 Pro with a specialized "expert analyst" prompt to match columns to questions.
+        Returns an empty list on failure.
         """
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
-        # Format questions and columns for the prompt
         questions_json_str = json.dumps([q.__dict__ for q in questions], indent=2)
         formatted_columns = "\n".join([f'{i}: "{header}"' for i, header in enumerate(column_headers)])
 
@@ -133,16 +133,12 @@ class QuestionNumberAligner:
 
         ---
         **INPUT DATA**
-
         **1. Survey Questions (JSON Format):**
         {questions_json_str}
-
         **2. Dataset Column Headers (Index: "Header"):**
         {formatted_columns}
-
         ---
         **YOUR TASK**
-
         Analyze the two inputs and generate the JSON output mapping every single column header from the list provided, following all instructions precisely.
         """
 
@@ -150,7 +146,8 @@ class QuestionNumberAligner:
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json"}
         }
-
+        
+        extracted_json_text = ""
         try:
             with st.spinner("AI is matching questions to columns... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
@@ -159,35 +156,40 @@ class QuestionNumberAligner:
 
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
-            extracted_json_text = content_part.get('text', '{}')
+            extracted_json_text = content_part.get('text', '{}').strip()
+            
+            if not extracted_json_text.startswith('{') or not extracted_json_text.endswith('}'):
+                st.error("Error: AI response for column matching was truncated or not valid JSON. This can happen with very large surveys.")
+                st.text_area("Invalid AI Response Snippet", value=extracted_json_text[:1000], height=150)
+                return []
 
             match_results = json.loads(extracted_json_text)
             return match_results.get('column_mapping', [])
 
         except requests.exceptions.RequestException as e:
             st.error(f"A network error occurred during AI matching: {e}")
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            st.error(f"Error parsing AI response for column matching. Error: {e}")
-            st.text_area("Raw AI Response", value=response.text, height=200)
+            return []
+        except json.JSONDecodeError as e:
+            st.error(f"Error parsing AI response for column matching. The response was not valid JSON. Error: {e}")
+            st.text_area("Raw AI Response", value=extracted_json_text, height=200)
+            return []
+        except (KeyError, IndexError) as e:
+            st.error(f"Error processing AI response structure. It might be missing expected keys. Error: {e}")
+            st.text_area("Raw AI Response", value=response.text if 'response' in locals() else "No response object.", height=200)
+            return []
         except Exception as e:
             st.error(f"An unexpected error occurred during AI Matching: {e}")
-        
-        # Return a default "UNMATCHED" structure on any failure
-        return [
-            {
-                "column_index": i,
-                "original_header": header,
-                "assigned_question": "UNMATCHED",
-                "reasoning": "AI matching failed or returned an error."
-            }
-            for i, header in enumerate(column_headers)
-        ]
+            return []
 
     def apply_numbering_to_dataset(self, df: pd.DataFrame, final_mapping_df: pd.DataFrame, prefix_format: str, include_unmatched: bool) -> pd.DataFrame:
         """Applies the final numbering to the dataset based on the review table."""
+        # Defensive check to prevent crashes from failed AI calls
+        if not isinstance(final_mapping_df, pd.DataFrame) or not {'Assigned #', 'Column Name'}.issubset(final_mapping_df.columns):
+            st.error("Could not apply numbering. The mapping table is missing required columns. This can happen if the AI matching process failed.")
+            return df # Return original dataframe to avoid crashing
+
         df_numbered = df.copy()
         
-        # Create a mapping dictionary from the final DataFrame
         mapping = pd.Series(final_mapping_df['Assigned #'].values, index=final_mapping_df['Column Name']).to_dict()
 
         if not include_unmatched:
@@ -197,9 +199,7 @@ class QuestionNumberAligner:
         new_columns = {}
         for col in df_numbered.columns:
             q_num = mapping.get(col)
-            # Check if q_num is a non-empty string that contains digits
             if q_num and q_num != 'UNMATCHED' and re.search(r'\d', str(q_num)):
-                # Sanitize q_num to just be the number for the prefix
                 num_only = re.search(r'\d+', str(q_num)).group()
                 new_columns[col] = f"{prefix_format.format(num=num_only)}{col}"
             else:
@@ -216,7 +216,6 @@ def create_streamlit_app():
     st.markdown("Automate survey column renumbering by matching a dataset (CSV/Excel) with a survey report (PDF).")
     st.markdown("---")
 
-    # Initialize session state
     if 'review_df' not in st.session_state: st.session_state.review_df = None
     if 'original_df' not in st.session_state: st.session_state.original_df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
@@ -230,7 +229,7 @@ def create_streamlit_app():
     with col2:
         pdf_file = st.file_uploader("Upload Survey Report (PDF)", type=['pdf'])
 
-    if data_file:
+    if data_file and 'original_df' not in st.session_state or st.session_state.original_df is None:
         try:
             df = pd.read_csv(data_file) if data_file.name.endswith('.csv') else pd.read_excel(data_file)
             st.session_state.original_df = df
@@ -241,7 +240,6 @@ def create_streamlit_app():
 
     st.markdown("---")
     
-    # Processing logic
     if data_file and pdf_file:
         if st.button("🚀 Start Full Renumbering Process", type="primary", use_container_width=True):
             st.session_state.questions = []
@@ -268,17 +266,16 @@ def create_streamlit_app():
                     st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
                     st.success("✅ AI matching complete!")
                 else:
-                    st.error("AI matching failed to produce results.")
+                    st.error("AI matching failed to produce results. Please check the errors above. You may need to try again or use a smaller/simpler survey.")
+                    st.session_state.review_df = None
             else:
                 st.error("AI question extraction failed. Cannot proceed with matching.")
 
-    # Display extracted questions if they exist
     if st.session_state.questions:
         with st.expander(f"📋 Review Extracted Questions ({len(st.session_state.questions)} total)"):
             questions_df = pd.DataFrame([q.__dict__ for q in st.session_state.questions])
             st.dataframe(questions_df, use_container_width=True, height=300)
 
-    # Display review table if it exists
     if st.session_state.review_df is not None:
         st.markdown("---")
         st.subheader("Step 2: Review and Manually Edit Matches")
@@ -311,7 +308,6 @@ def create_streamlit_app():
             st.toast("Changes confirmed and saved!", icon="👍")
             st.rerun()
 
-        # --- EXPORT ---
         st.markdown("---")
         st.subheader("Step 3: Download Renumbered File")
         
@@ -325,10 +321,9 @@ def create_streamlit_app():
         with col2:
             include_unmatched = st.checkbox("Include unmatched columns in final file", value=True)
         
-        # Use the current state of the editor for applying numbering
         final_df = aligner.apply_numbering_to_dataset(
             st.session_state.original_df, 
-            st.session_state.editor, # Use the live data from the editor
+            st.session_state.editor,
             prefix_format,
             include_unmatched
         )
