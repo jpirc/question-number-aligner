@@ -56,23 +56,28 @@ class QuestionNumberAligner:
         
         prompt = """
         You are an expert data cleaning assistant specializing in survey reports.
-        Analyze the provided PDF document. Your only task is to identify and extract every numbered question.
+        Analyze the provided PDF document. Your task is to identify and extract EVERY numbered question.
+
+        IMPORTANT: Some surveys have repeated questions for different test groups (e.g., HOH BDAY, HOH PUP, DREAMS BOGO).
+        Make sure to capture ALL instances, even if the question text is similar.
 
         Follow these rules strictly:
-        1.  Ignore everything that is not a numbered question. This includes page headers, footers, charts, graphs, data tables, answer choices, and percentages.
-        2.  Extract the full, complete question text, even if it spans multiple lines.
-        3.  Clean the question text perfectly. Remove any trailing text, answer options, or junk characters.
-        4.  Return the output as a single, valid JSON object. The keys should be the question numbers as strings, and the values should be the clean question text.
-        
-        Example of a perfect response:
+        1. Extract ALL questions that start with a number followed by a period (e.g., "1.", "12.", "180.")
+        2. Include the FULL question text, including any prefixes like "HOH BDAY -" or "DREAMS FLASH -"
+        3. Extract questions even if they appear multiple times with different prefixes
+        4. Include questions from ALL sections of the document
+        5. Clean the text but preserve important identifiers
+        6. Return as a valid JSON object with question numbers as keys and full question text as values
+
+        The response must be valid JSON with this exact format:
         {
           "1": "To which gender identity do you most identify? Select one.",
-          "3": "What is your age?",
-          "4": "What region of the country do you currently live in?",
-          "6": "Which of the following do you currently own? Select all that apply.",
           "12": "HOH BDAY - How much do you like this ad?",
-          "46": "HOH PUP - How much do you like this ad?"
+          "46": "HOH PUP - How much do you like this ad?",
+          "180": "Do you consider yourself Hispanic/Latino or not Hispanic/Latino?"
         }
+
+        Extract EVERY question - there should be many questions, potentially over 100 in a full survey.
         """
         
         payload = {
@@ -81,30 +86,46 @@ class QuestionNumberAligner:
         }
 
         try:
-            response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
-            response.raise_for_status()
+            with st.spinner("Calling Gemini API..."):
+                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
+                response.raise_for_status()
+                
+            # Log the raw response for debugging
             response_json = response.json()
+            
+            with st.expander("🔍 API Response Details (for debugging)"):
+                st.json(response_json)
             
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
             extracted_json_text = content_part.get('text', '{}')
             
+            # Log the extracted JSON
+            with st.expander("📝 Extracted Questions JSON"):
+                st.code(extracted_json_text, language='json')
+            
             question_dict = json.loads(extracted_json_text)
             
-            questions = [Question(number=str(num), text=text, question_type=self._determine_question_type(text)) for num, text in question_dict.items()]
-            return questions
+            # Log question count
+            st.info(f"📊 Extracted {len(question_dict)} questions from the PDF")
+            
+            questions = [Question(number=str(num), text=text, question_type=self._determine_question_type(text)) 
+                        for num, text in question_dict.items()]
+            return sorted(questions, key=lambda q: int(q.number))
 
         except requests.exceptions.RequestException as e:
             st.error(f"Network error calling Gemini API: {e}")
             return []
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             st.error(f"Error parsing response from Gemini API: {e}")
-            st.error("The API may have returned an unexpected format. Check the raw response:")
-            if 'response' in locals():
-                st.json(response.json())
+            if 'extracted_json_text' in locals():
+                st.error("Extracted text that failed to parse:")
+                st.code(extracted_json_text)
             return []
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}")
+            import traceback
+            st.error(traceback.format_exc())
             return []
 
     def _determine_question_type(self, text: str) -> str:
@@ -282,22 +303,97 @@ def create_streamlit_app():
     # Step 2: Extract Questions
     st.markdown("---")
     st.subheader("Step 2: Extract Questions from PDF")
-    if pdf_file:
-        if st.button("🤖 Extract Questions with AI", type="primary", use_container_width=True):
-            with st.spinner("AI is reading and analyzing your PDF... This may take a moment."):
-                pdf_bytes = pdf_file.getvalue()
-                st.session_state.questions = aligner.extract_questions_with_gemini(pdf_bytes)
-            if st.session_state.questions:
-                st.success(f"✅ AI successfully extracted {len(st.session_state.questions)} questions.")
-            else:
-                st.error("AI extraction failed. Please check the error messages above or try a different PDF.")
-    else:
-        st.info("Upload a PDF to enable AI question extraction.")
+    
+    # Add tabs for different input methods
+    tab1, tab2 = st.tabs(["🤖 AI Extraction", "✏️ Manual Entry"])
+    
+    with tab1:
+        if pdf_file:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                if st.button("🤖 Extract Questions with AI", type="primary", use_container_width=True):
+                    with st.spinner("AI is reading and analyzing your PDF... This may take a moment."):
+                        pdf_bytes = pdf_file.getvalue()
+                        st.session_state.questions = aligner.extract_questions_with_gemini(pdf_bytes)
+                    if st.session_state.questions:
+                        st.success(f"✅ AI successfully extracted {len(st.session_state.questions)} questions.")
+                    else:
+                        st.error("AI extraction failed. Please check the error messages above or try manual entry.")
+            with col2:
+                if st.button("🔄 Retry Extraction", use_container_width=True):
+                    st.cache_data.clear()
+                    st.rerun()
+        else:
+            st.info("Upload a PDF to enable AI question extraction.")
+    
+    with tab2:
+        st.markdown("##### Paste Questions (JSON or Text Format)")
+        st.info("If AI extraction fails or misses questions, paste them here in JSON format or as numbered list.")
+        
+        manual_questions = st.text_area(
+            "Enter questions",
+            height=300,
+            placeholder='''Option 1 - JSON format:
+{
+  "1": "To which gender identity do you most identify? Select one.",
+  "12": "HOH BDAY - How much do you like this ad?",
+  "180": "Do you consider yourself Hispanic/Latino?"
+}
+
+Option 2 - Simple list:
+1. To which gender identity do you most identify? Select one.
+12. HOH BDAY - How much do you like this ad?
+180. Do you consider yourself Hispanic/Latino?''',
+            key="manual_questions"
+        )
+        
+        if st.button("📝 Process Manual Questions", use_container_width=True):
+            if manual_questions.strip():
+                try:
+                    # Try JSON format first
+                    if manual_questions.strip().startswith('{'):
+                        question_dict = json.loads(manual_questions)
+                        st.session_state.questions = [
+                            Question(number=str(num), text=text, question_type=aligner._determine_question_type(text))
+                            for num, text in question_dict.items()
+                        ]
+                    else:
+                        # Parse as numbered list
+                        questions = []
+                        for line in manual_questions.strip().split('\n'):
+                            match = re.match(r'^(\d+)\.\s+(.+)', line.strip())
+                            if match:
+                                num, text = match.groups()
+                                questions.append(Question(
+                                    number=num,
+                                    text=text.strip(),
+                                    question_type=aligner._determine_question_type(text)
+                                ))
+                        st.session_state.questions = questions
+                    
+                    if st.session_state.questions:
+                        st.success(f"✅ Successfully processed {len(st.session_state.questions)} questions.")
+                    else:
+                        st.error("No valid questions found. Check your format.")
+                        
+                except json.JSONDecodeError as e:
+                    st.error(f"JSON parsing error: {e}")
+                except Exception as e:
+                    st.error(f"Error processing questions: {e}")
 
     if st.session_state.questions:
-        with st.expander("📋 Review Extracted Questions"):
+        with st.expander(f"📋 Review Extracted Questions ({len(st.session_state.questions)} total)"):
+            # Show questions in a more readable format
+            questions_df = pd.DataFrame([
+                {"Number": q.number, "Text": q.text, "Type": q.question_type}
+                for q in sorted(st.session_state.questions, key=lambda x: int(x.number))
+            ])
+            st.dataframe(questions_df, use_container_width=True, height=400)
+            
+            # Also provide JSON for easy copying
+            st.markdown("##### JSON Format (for reuse):")
             question_dict = {q.number: q.text for q in st.session_state.questions}
-            st.json(question_dict)
+            st.code(json.dumps(question_dict, indent=2), language='json')
 
     # Step 3: Run Alignment
     if st.session_state.df is not None and st.session_state.questions:
