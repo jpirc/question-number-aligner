@@ -44,20 +44,15 @@ class QuestionNumberAligner:
         e.g., ['Q1_a', 'Q1_b', 'Q2'] -> {'Q1_': [0, 1]}
         """
         groups = defaultdict(list)
-        # Regex to find a prefix ending in a common delimiter (_, -, .)
-        # It looks for a sequence of non-delimiter characters followed by a delimiter.
         prefix_regex = re.compile(r'^(.+?[\W_])') 
 
         for i, header in enumerate(column_headers):
             match = prefix_regex.match(header)
             if match:
                 prefix = match.group(1)
-                # To avoid grouping things like "Question 1", "Question 2"
-                # we can add a simple heuristic: the prefix should not end with a digit followed by the delimiter.
-                if not prefix[-2].isdigit():
+                if len(prefix) > 1 and not prefix[-2].isdigit():
                     groups[prefix].append(i)
         
-        # Filter out groups with only one member, as they aren't groups.
         return {prefix: indices for prefix, indices in groups.items() if len(indices) > 1}
 
     def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
@@ -125,45 +120,56 @@ class QuestionNumberAligner:
 
     def match_with_gemini(self, questions: List[Question], column_headers: List[str]) -> List[Dict[str, Any]]:
         """
-        Uses Gemini 1.5 Pro with a specialized "expert analyst" prompt to match columns to questions.
-        Returns an empty list on failure.
+        Uses Gemini 1.5 Pro with a compressed, specialized prompt to match columns to questions.
         """
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
-        # **NEW**: Analyze column patterns first
+        # --- PROMPT COMPRESSION LOGIC ---
         column_groups = self._analyze_column_patterns(column_headers)
         
-        questions_json_str = json.dumps([q.__dict__ for q in questions], indent=2)
-        formatted_columns = "\n".join([f'{i}: "{header}"' for i, header in enumerate(column_headers)])
-        formatted_groups = json.dumps(column_groups, indent=2)
+        # Create a set of all indices that are part of a group
+        grouped_indices = set()
+        for indices in column_groups.values():
+            grouped_indices.update(indices)
+            
+        # Create a compact list of individual (ungrouped) columns
+        individual_columns = {
+            i: header for i, header in enumerate(column_headers) if i not in grouped_indices
+        }
+
+        # Create a compact, numbered list of questions
+        compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions])
+        
+        # Use compact JSON formatting for the API call
+        formatted_groups = json.dumps(column_groups, separators=(',', ':'))
+        formatted_individual_columns = json.dumps(individual_columns, separators=(',', ':'))
 
         prompt = f"""
-        You are an expert market research data analyst. Your task is to map a list of raw dataset column headers to a structured list of survey questions.
+        You are an expert market research data analyst. Your task is to map dataset columns to survey questions.
 
         **CRITICAL INSTRUCTIONS:**
-        1.  **High Accuracy Over Completeness:** It is MANDATORY to be accurate. If you are not highly confident in a match, you MUST assign "UNMATCHED". It is better to leave a column unmatched than to assign it an incorrect question number.
-        2.  **Strict Order Preservation:** The final output MUST be an array of objects that corresponds exactly to the original order of the input column headers, from index 0 to {len(column_headers) - 1}. Do not reorder the columns.
-        3.  **Handle Complex Questions & Groups:** I have pre-analyzed the column headers and identified likely groups (matrix questions, multi-selects). You MUST use this information. When a group is identified, assign the SAME question number to ALL columns in that group.
-        4.  **No Forced Matches:** Do NOT match internal system variables, metadata, or programming notes (e.g., 'record_id', 'start_time', 'end_time', 'device_type', 'user_ip', 'weight'). Assign these "UNMATCHED".
-        5.  **Output Format:** Your entire response must be ONLY a single JSON object. Do not include any text, code block markers, or explanations outside of the JSON. The JSON object must have a single key, "column_mapping", which is an array of objects. Each object must have four keys: "column_index" (integer), "original_header" (string), "assigned_question" (string, either the question number or "UNMATCHED"), and "reasoning" (a brief string explaining your decision).
+        1.  **Accuracy is Mandatory:** If you are not highly confident, assign "UNMATCHED". Do not guess.
+        2.  **Handle Groups:** For the "Pre-Analyzed Column Groups", assign the SAME question number to ALL columns in that group.
+        3.  **Handle Individuals:** Match the "Individual Columns" to the most appropriate question from the "Survey Questions" list.
+        4.  **No Forced Matches:** Assign "UNMATCHED" to system variables or metadata (e.g., 'record_id', 'start_time').
+        5.  **Output Format:** Your response MUST be a single JSON object with one key, "column_mapping". This key holds an array of objects, one for each original column, maintaining the original order from index 0 to {len(column_headers) - 1}. Each object needs: "column_index" (int), "original_header" (str), "assigned_question" (str), and "reasoning" (str).
 
         ---
         **INPUT DATA**
 
-        **1. Survey Questions (JSON Format):**
-        {questions_json_str}
+        **1. Survey Questions (Number: Text):**
+        {compact_questions}
 
-        **2. Dataset Column Headers (Index: "Header"):**
-        {formatted_columns}
-
-        **3. Pre-Analyzed Column Groups (Prefix: [Column Indices]):**
-        These columns likely belong together as part of a single complex question.
+        **2. Pre-Analyzed Column Groups (Prefix: [Column Indices]):**
         {formatted_groups}
+
+        **3. Individual Columns (Index: Header):**
+        {formatted_individual_columns}
 
         ---
         **YOUR TASK**
-        Analyze all inputs and generate the JSON output mapping every single column header from the list provided, following all instructions precisely. Prioritize the pre-analyzed groups.
+        Analyze all inputs and generate the complete JSON output mapping ALL original column headers.
         """
 
         payload = {
@@ -173,7 +179,7 @@ class QuestionNumberAligner:
         
         extracted_json_text = ""
         try:
-            with st.spinner("AI is matching questions to columns (with pattern analysis)... This may take a moment."):
+            with st.spinner("AI is matching questions to columns (with compressed prompt)... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
                 response.raise_for_status()
             response_json = response.json()
