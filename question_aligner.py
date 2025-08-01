@@ -52,27 +52,27 @@ class QuestionNumberAligner:
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
-        # --- IMPROVED PROMPT ---
-        # This prompt is more specific about handling complex layouts like matrix and ranking questions.
+        # --- NEW, MORE ROBUST PROMPT ---
         prompt = """
-        You are an expert data cleaning assistant specializing in survey reports.
-        Your task is to analyze the provided PDF document and extract EVERY numbered question.
+        You are a highly specialized text extraction tool. Your ONLY function is to scan the provided PDF and find every instance of a line that begins with a number followed by a period.
 
-        Follow these rules with extreme precision:
-        1.  Your primary goal is to find every single piece of text that starts with a number and a period (e.g., "1.", "30.", "175.").
-        2.  Extract the full, complete question text that follows this number. This includes any prefixes like "HOH BDAY -".
-        3.  **Crucially, for matrix or ranking questions** (e.g., "How much do you agree..." or "Please rank the following..."), the introductory sentence IS the question. You must extract this sentence and then STOP. Do not include the list of statements, options, or the rating scale that follows.
-        4.  Ignore all other text that is not part of a numbered question, such as page headers, footers, charts, data tables, and individual answer choices for single-select questions.
-        5.  The final output must be a single, valid JSON object. The keys must be the question numbers (as strings), and the values must be the clean, full question text.
+        Follow these steps:
+        1.  Read the entire document page by page.
+        2.  Identify every piece of text that matches the pattern `[NUMBER]. [QUESTION TEXT]`.
+        3.  For each match, capture the number and the complete question text that follows. The question text ends when you encounter a chart, a data table (often starting with "Answer Count Percent"), or the start of the next numbered question.
+        4.  Clean the extracted text to form a single, coherent sentence. Remove any line breaks or formatting noise within the question itself.
+        5.  Assemble the results into a single, valid JSON object where the keys are the question numbers (as strings) and the values are the cleaned question text.
+
+        **CRITICAL INSTRUCTION:** Do not be deterred by messy tables or complex layouts. If you see "39. Please rank the following...", you MUST extract it, even if it's surrounded by charts and tables. Your job is to find the numbered question text itself, no matter what.
 
         Example of a perfect response for different question types:
         {
-          "29": "HOH BDAY - Which of the following emotions did you feel when watching this ad? Please select all that apply.",
-          "30": "HOH BDAY - How much do you agree or disagree with the following statements?",
-          "39": "HOH BDAY - Please rank the following factors from most to least appealing to when considering a kitchen renovation."
+          "39": "HOH BDAY - Please rank the following factors from most to least appealing to when considering a kitchen renovation.",
+          "40": "HOH BDAY - Which one of the two taglines do you like the most for this campaign?",
+          "42": "HOH BDAY - The ads mentioned the “Shop Your Way” program. How much do you agree or disagree with the following statements about the “Shop Your Way” program?"
         }
 
-        Do not miss any questions. Scan every page thoroughly. There should be many questions, often over 100.
+        Find every single question. Do not skip any.
         """
         
         payload = {
@@ -109,7 +109,6 @@ class QuestionNumberAligner:
             st.error("GEMINI_API_KEY is not set. Cannot perform AI matching.")
             return {}
 
-        # --- MODEL UPGRADE ---
         # Switched to the more powerful 'pro' model to handle large inputs/outputs without truncation.
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
