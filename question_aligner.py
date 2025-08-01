@@ -7,6 +7,7 @@ from typing import Dict, List, Any
 from dataclasses import dataclass
 import streamlit as st
 import io
+import os
 
 # --- Data Classes ---
 @dataclass
@@ -183,10 +184,9 @@ class QuestionNumberAligner:
 
     def apply_numbering_to_dataset(self, df: pd.DataFrame, final_mapping_df: pd.DataFrame, prefix_format: str, include_unmatched: bool) -> pd.DataFrame:
         """Applies the final numbering to the dataset based on the review table."""
-        # Defensive check to prevent crashes from failed AI calls
         if not isinstance(final_mapping_df, pd.DataFrame) or not {'Assigned #', 'Column Name'}.issubset(final_mapping_df.columns):
             st.error("Could not apply numbering. The mapping table is missing required columns. Please click 'Confirm All Changes' after editing.")
-            return pd.DataFrame() # Return empty dataframe to avoid crashing downstream
+            return pd.DataFrame() 
 
         df_numbered = df.copy()
         
@@ -219,6 +219,7 @@ def create_streamlit_app():
     if 'review_df' not in st.session_state: st.session_state.review_df = None
     if 'original_df' not in st.session_state: st.session_state.original_df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
+    if 'loaded_data_file_name' not in st.session_state: st.session_state.loaded_data_file_name = ""
     
     aligner = QuestionNumberAligner()
 
@@ -229,16 +230,15 @@ def create_streamlit_app():
     with col2:
         pdf_file = st.file_uploader("Upload Survey Report (PDF)", type=['pdf'])
 
-    # Load data file into state immediately
-    if data_file and (st.session_state.original_df is None or data_file.name != st.session_state.get('loaded_data_file_name')):
+    if data_file and data_file.name != st.session_state.loaded_data_file_name:
         try:
             df = pd.read_csv(data_file) if data_file.name.endswith('.csv') else pd.read_excel(data_file)
             st.session_state.original_df = df
             st.session_state.loaded_data_file_name = data_file.name
-            # Reset downstream state if a new file is uploaded
             st.session_state.review_df = None
             st.session_state.questions = []
             st.success(f"✅ Dataset loaded: {len(df)} rows, {len(df.columns)} columns.")
+            st.rerun()
         except Exception as e:
             st.error(f"Error loading dataset: {e}")
             st.session_state.original_df = None
@@ -318,7 +318,6 @@ def create_streamlit_app():
         with col2:
             include_unmatched = st.checkbox("Include unmatched columns in final file", value=True)
         
-        # The download logic now uses the canonical st.session_state.review_df
         final_df = aligner.apply_numbering_to_dataset(
             st.session_state.original_df, 
             st.session_state.review_df,
@@ -330,6 +329,10 @@ def create_streamlit_app():
             st.markdown("##### Preview of Renumbered Data")
             st.dataframe(final_df.head())
             
+            base_filename = os.path.splitext(st.session_state.loaded_data_file_name)[0]
+            renumbered_excel_filename = f"{base_filename}_renumbered.xlsx"
+            renumbered_csv_filename = f"{base_filename}_renumbered.csv"
+
             c1, c2 = st.columns(2)
             with c1:
                 output = io.BytesIO()
@@ -339,7 +342,7 @@ def create_streamlit_app():
                 st.download_button(
                     label="📑 Download as Excel",
                     data=excel_data,
-                    file_name="renumbered_dataset.xlsx",
+                    file_name=renumbered_excel_filename,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
@@ -349,7 +352,7 @@ def create_streamlit_app():
                 st.download_button(
                     label="📄 Download as CSV",
                     data=csv,
-                    file_name="renumbered_dataset.csv",
+                    file_name=renumbered_csv_filename,
                     mime="text/csv",
                     use_container_width=True
                 )
