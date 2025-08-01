@@ -32,6 +32,7 @@ class QuestionNumberAligner:
     """Handles the logic for parsing and matching questions using the Gemini AI."""
 
     def __init__(self):
+        # Keywords to help classify questions after they've been extracted by the AI.
         self.question_patterns = {
             'multi_response': ['select all that apply', 'check all that apply', 'please select all', 'choose as many'],
             'matrix': ['how much do you agree', 'please rate', 'on a scale', 'how appealing', 'rate the following'],
@@ -39,12 +40,15 @@ class QuestionNumberAligner:
         }
 
     def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
-        """Sends a PDF file to the Gemini API to extract questions."""
+        """
+        Sends a PDF file to the Gemini API to extract questions and returns them as a list of Question objects.
+        """
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         if not api_key:
-            st.error("GEMINI_API_KEY is not set in your Streamlit secrets.")
+            st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
             return []
 
+        # Using the more powerful 'pro' model for the complex extraction task.
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
@@ -96,103 +100,70 @@ class QuestionNumberAligner:
             st.error(f"An error occurred during AI Question Extraction: {e}")
             return []
 
-    # --- HELPER METHODS RESTORED TO FIX ATTRIBUTE ERROR ---
-    def clean_column_name(self, col_name: str) -> str:
-        """Cleans and standardizes a column name for better matching."""
-        if not isinstance(col_name, str):
-            return ""
-        cleaned = re.sub(r'[^\w\s-]', ' ', col_name)
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        return cleaned.lower()
-
-    def calculate_similarity(self, str1: str, str2: str) -> float:
-        """Calculates a similarity ratio between two strings."""
-        return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
-
-    def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Tuple[Dict[str, str], Dict[str, float]]:
+    def match_with_gemini(self, df: pd.DataFrame, questions: List[Question]) -> Dict[str, str]:
         """
-        A more robust, two-pass matching algorithm using "anchoring" and "interpolation".
+        Uses the Gemini API to perform the matching between dataset columns and extracted questions.
         """
-        columns = list(df.columns)
-        mapping = {col: 'UNMATCHED' for col in columns}
-        confidence_scores = {col: 0.0 for col in columns}
-        
-        sorted_questions = sorted(questions, key=lambda q: int(q.number))
-        
-        # --- Pass 1: High-Confidence Anchoring ---
-        anchors = []
-        used_q_indices = set()
-        for i, col in enumerate(columns):
-            clean_col = self.clean_column_name(col)
-            if ' - ' in col: continue 
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        if not api_key:
+            st.error("GEMINI_API_KEY is not set. Cannot perform AI matching.")
+            return {}
+
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+
+        question_dict = {q.number: q.text for q in questions}
+        column_list = list(df.columns)
+
+        # --- NEW, MORE GENERALIZED AND ROBUST PROMPT ---
+        prompt = f"""
+        You are an expert survey data analyst. Your task is to align dataset column headers with a list of official survey questions.
+        You will be provided with two JSON objects:
+        1. `survey_questions`: A dictionary where keys are question numbers and values are the full question text.
+        2. `column_headers`: A list of column header strings from the dataset.
+
+        Follow these rules precisely:
+        1.  For each `column_header`, find the single best matching `survey_question`.
+        2.  **Recognize Multi-Column Questions:** Questions like multi-selects, matrix, or ranking questions are represented by multiple columns in the dataset. These columns usually share the same base text. For example, "Q7. Which do you own? - Car" and "Q7. Which do you own? - Boat" should BOTH map to question "7". You MUST correctly assign the same question number to all parts of a multi-column question.
+        3.  **Use Sequential Order as a Guide:** The order of `column_headers` generally follows the order of `survey_questions`. Use this as a strong clue, but be flexible. The survey may have repeating blocks of questions (monadic design).
+        4.  **Do Not Force a Match:** If a `column_header` does not clearly correspond to any of the `survey_questions` (e.g., it is a programming note, an open-ended response field not in the PDF, or metadata), you MUST assign it the value "UNMATCHED". It is better to leave a column unmatched than to assign it an incorrect number.
+        5.  Your final output must be a single, valid JSON object where the keys are the exact original `column_headers` and the values are the corresponding question numbers (as strings) or the string "UNMATCHED".
+
+        Here are the inputs:
+
+        **Survey Questions:**
+        {json.dumps(question_dict, indent=2)}
+
+        **Column Headers:**
+        {json.dumps(column_list, indent=2)}
+
+        Now, provide the final JSON mapping object.
+        """
+
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json"}
+        }
+
+        try:
+            with st.spinner("Calling Gemini 1.5 Pro for intelligent matching..."):
+                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
+                response.raise_for_status()
             
-            for j, q in enumerate(sorted_questions):
-                if j in used_q_indices: continue
-                score = self.calculate_similarity(clean_col, q.text)
-                if score > 0.95:
-                    anchors.append({'col_idx': i, 'q_idx': j})
-                    used_q_indices.add(j)
-                    break 
-
-        # --- Pass 2: Interpolation between Anchors ---
-        proc_anchors = [{'col_idx': -1, 'q_idx': -1}] + anchors + [{'col_idx': len(columns), 'q_idx': len(sorted_questions)}]
-
-        for i in range(len(proc_anchors) - 1):
-            start_anchor = proc_anchors[i]
-            end_anchor = proc_anchors[i+1]
-
-            col_segment_indices = range(start_anchor['col_idx'] + 1, end_anchor['col_idx'])
-            q_segment = sorted_questions[start_anchor['q_idx'] + 1 : end_anchor['q_idx']]
-
-            if not col_segment_indices or not q_segment:
-                continue
-
-            processed_in_segment = set()
-            for col_idx in col_segment_indices:
-                if col_idx in processed_in_segment: continue
-                
-                col = columns[col_idx]
-                base_question = col.split(' - ')[0].strip()
-                
-                if ' - ' in col and len(base_question) > 10:
-                    group_cols_indices = [c_idx for c_idx in col_segment_indices if columns[c_idx].startswith(base_question + ' - ')]
-                    
-                    if len(group_cols_indices) > 1:
-                        best_q, best_score = None, 0.0
-                        for q in q_segment:
-                            if q.question_type != 'multi': continue
-                            score = self.calculate_similarity(self.clean_column_name(base_question), q.text)
-                            if score > best_score:
-                                best_score, best_q = score, q
-                        
-                        if best_q and best_score > 0.70:
-                            for group_col_idx in group_cols_indices:
-                                mapping[columns[group_col_idx]] = best_q.number
-                                confidence_scores[columns[group_col_idx]] = best_score
-                                processed_in_segment.add(group_col_idx)
-
-        q_cursor = 0
-        for i, col in enumerate(columns):
-            if mapping[col] != 'UNMATCHED': continue
-
-            clean_col = self.clean_column_name(col)
-            best_q, best_score, best_q_idx = None, 0.0, -1
+            response_json = response.json()
             
-            search_window = sorted_questions[q_cursor : min(q_cursor + 20, len(sorted_questions))]
-            
-            for j, q in enumerate(search_window):
-                score = self.calculate_similarity(clean_col, q.text)
-                proximity_bonus = max(0, 1 - (j / 20)) * 0.2
-                score += proximity_bonus
-                if score > best_score:
-                    best_score, best_q, best_q_idx = score, q, q_cursor + j
-            
-            if best_q and best_score > 0.70:
-                mapping[col] = best_q.number
-                confidence_scores[col] = best_score
-                q_cursor = best_q_idx + 1
-        
-        return mapping, confidence_scores
+            with st.expander("🔍 AI Matching Response (for debugging)"):
+                st.json(response_json)
+
+            candidate = response_json.get('candidates', [{}])[0]
+            content_part = candidate.get('content', {}).get('parts', [{}])[0]
+            mapping_json_text = content_part.get('text', '{}')
+
+            mapping = json.loads(mapping_json_text)
+            return mapping
+
+        except Exception as e:
+            st.error(f"An error occurred during AI Matching: {e}")
+            return {col: "ERROR" for col in column_list}
 
     def _determine_question_type(self, text: str) -> str:
         text_lower = text.lower()
@@ -278,10 +249,9 @@ def create_streamlit_app():
 
     if st.session_state.df is not None and st.session_state.questions:
         st.markdown("---")
-        st.subheader("Step 3: Run Automatic Alignment")
-        if st.button("🚀 Run Automatic Alignment", use_container_width=True):
-            with st.spinner("Running new 'self-healing' matching algorithm..."):
-                st.session_state.mapping, st.session_state.confidence_scores = aligner.match_columns_to_questions(st.session_state.df, st.session_state.questions)
+        st.subheader("Step 3: Run AI-Powered Alignment")
+        if st.button("🚀 Run AI Alignment", use_container_width=True):
+            st.session_state.mapping = aligner.match_with_gemini(st.session_state.df, st.session_state.questions)
     
     if st.session_state.mapping:
         st.markdown("---")
@@ -299,17 +269,16 @@ def create_streamlit_app():
         st.markdown("##### Review and Edit Mappings")
         st.info("💡 Tip: Review the AI's matches. You can manually enter a question number in the 'Assigned #' column for any row.")
         
+        # Create the DataFrame for editing from the main mapping
         review_data = []
         for i, col in enumerate(st.session_state.df.columns):
             q_num = st.session_state.mapping.get(col, 'UNMATCHED')
-            confidence = st.session_state.confidence_scores.get(col, 0.0)
             matched_text = f"Q{q_num}. {question_lookup.get(str(q_num), 'Text not found')}" if str(q_num) != 'UNMATCHED' else 'N/A - Unmatched'
             
             review_data.append({
                 'Col': index_to_excel_col(i),
                 'Column Name': col,
                 'Matched Question Text': matched_text,
-                'Confidence': confidence,
                 'Assigned #': str(q_num)
             })
         
@@ -322,7 +291,6 @@ def create_streamlit_app():
                 "Col": st.column_config.TextColumn("Col", width="small", disabled=True),
                 "Column Name": st.column_config.TextColumn("Column Name", width="large", disabled=True),
                 "Matched Question Text": st.column_config.TextColumn("Matched Question Text", width="large", disabled=True),
-                "Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1, format="%.0%"),
                 "Assigned #": st.column_config.TextColumn(
                     "Assigned #",
                     help="Manually enter a question number here (e.g., '7', '12', '180')."
