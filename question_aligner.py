@@ -109,47 +109,47 @@ class QuestionNumberAligner:
             st.error(f"An unexpected error occurred during AI Question Extraction: {e}")
             return []
 
-    def _match_batch_with_gemini(self, questions: List[Question], column_batch: Dict[int, str]) -> str:
+    def _match_batch_with_gemini(self, questions_window: List[Question], column_batch: Dict[int, str], last_q_num: int) -> str:
         """
-        Processes a single batch of columns and returns a simple pipe-delimited string.
-        Returns an empty string on failure.
+        Processes a single batch of columns with sequential context.
+        Returns a simple pipe-delimited string.
         """
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
-        compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions])
+        compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
 
         prompt = f"""
-        You are an expert market research data analyst. Your task is to map a batch of dataset columns to a full list of survey questions.
+        You are an expert market research data analyst. Your task is to map a batch of dataset columns to a list of survey questions, maintaining a strict numerical sequence.
 
         **CRITICAL INSTRUCTIONS:**
-        1.  **Accuracy is Mandatory:** If not highly confident, assign "UNMATCHED".
-        2.  **Handle Multi-Part Questions:** If multiple columns belong to the same question (e.g., "Q5 - Option A", "Q5 - Option B"), assign the SAME question number to all of them.
-        3.  **No Forced Matches:** Assign "UNMATCHED" to system variables (e.g., 'Response ID').
+        1.  **SEQUENTIAL CONTEXT IS MANDATORY:** In the previous batch, the last assigned question number was **{last_q_num}**. You MUST continue the numbering from there. Do not jump backwards to earlier question numbers, even if the text seems to match. This is likely a monadic study with repeating question blocks.
+        2.  **Accuracy is Mandatory:** If not highly confident, assign "UNMATCHED".
+        3.  **Handle Multi-Part Questions:** If multiple columns belong to the same question (e.g., "Q65 - Option A", "Q65 - Option B"), assign the SAME question number to all of them.
         4.  **Output Format:** Your response MUST be plain text. Each line MUST follow this exact format: `column_index|assigned_question|reasoning`. Use the pipe `|` character as a delimiter. Do not output JSON or any other format.
-        5.  **Assigned Question VALUE:** For the "assigned_question" part, you MUST return ONLY the question number (e.g., "1", "3", "42a") or the literal string "UNMATCHED".
+        5.  **Assigned Question VALUE:** For the "assigned_question" part, you MUST return ONLY the question number (e.g., "63", "64a") or the literal string "UNMATCHED".
 
         Example Response:
-        150|UNMATCHED|System variable.
-        151|25|Matches question about social media usage.
-        152|25|Option for question 25.
+        150|63|Follows sequence from last batch.
+        151|64|Matches question about social media usage.
+        152|64|Option for question 64.
 
         ---
         **INPUT DATA**
-        1. Full Survey Questions List (Number: Text):
+        1. Available Survey Questions (Number: Text):
         {compact_questions}
 
         2. Batch of Dataset Column Headers to Map (Index: Header):
         {formatted_columns}
         ---
         **YOUR TASK**
-        Analyze the inputs and generate the pipe-delimited text output mapping ALL column indices in the provided batch.
+        Analyze the inputs and generate the pipe-delimited text output mapping ALL column indices in the provided batch, respecting the sequential context.
         """
 
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "text/plain"}, # Ask for plain text
+            "generationConfig": {"responseMimeType": "text/plain"},
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -180,12 +180,15 @@ class QuestionNumberAligner:
 
     def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = 150) -> Dict[str, Dict[str, str]]:
         """
-        Orchestrates the matching process by splitting columns into batches,
-        calling the AI for each batch, and parsing the simple text response.
+        Orchestrates the stateful, sequential matching process.
         """
         full_mapping = {}
+        last_matched_q_num = 0
+        question_lookup = {int(re.search(r'\d+', q.number).group()): q for q in questions if re.search(r'\d+', q.number)}
+        question_indices = sorted(question_lookup.keys())
+
         num_batches = (len(column_headers) + batch_size - 1) // batch_size
-        progress_bar = st.progress(0, text="Starting batch processing...")
+        progress_bar = st.progress(0, text="Starting sequential batch processing...")
 
         for i in range(num_batches):
             start_index = i * batch_size
@@ -194,30 +197,47 @@ class QuestionNumberAligner:
             
             column_batch_dict = {start_index + j: header for j, header in enumerate(batch_headers)}
 
-            progress_text = f"Processing batch {i+1} of {num_batches} (Columns {start_index}-{end_index-1})..."
+            # Create a "window" of questions for the AI to consider
+            window_start_q_num = max(0, last_matched_q_num - 5) # Look back a little
+            
+            # Find the index in our sorted list to start the window from
+            window_start_index = 0
+            for idx, q_num in enumerate(question_indices):
+                if q_num >= window_start_q_num:
+                    window_start_index = idx
+                    break
+            
+            questions_window = [question_lookup[q_num] for q_num in question_indices[window_start_index:]]
+
+            progress_text = f"Processing batch {i+1}/{num_batches} (Context: Start from Q{last_matched_q_num+1})"
             progress_bar.progress((i) / num_batches, text=progress_text)
             
-            # The AI now returns a simple string
-            response_string = self._match_batch_with_gemini(questions, column_batch_dict)
+            response_string = self._match_batch_with_gemini(questions_window, column_batch_dict, last_matched_q_num)
             
             if not response_string:
                 st.error(f"Batch {i+1} failed: Received an empty response from the AI. Stopping process.")
                 progress_bar.empty()
                 return {}
 
-            # **NEW**: Parse the simple string response in Python
+            max_q_in_batch = last_matched_q_num
             for line in response_string.split('\n'):
                 parts = line.strip().split('|')
                 if len(parts) == 3:
-                    col_idx, assigned_q, reasoning = parts
+                    col_idx, assigned_q_str, reasoning = parts
                     full_mapping[col_idx] = {
-                        "assigned_question": assigned_q,
+                        "assigned_question": assigned_q_str,
                         "reasoning": reasoning
                     }
+                    # Update the last matched question number
+                    match = re.search(r'\d+', assigned_q_str)
+                    if match:
+                        current_q_num = int(match.group())
+                        if current_q_num > max_q_in_batch:
+                            max_q_in_batch = current_q_num
                 else:
-                    # This handles cases where a line might be malformed, preventing a crash.
                     st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
-
+            
+            last_matched_q_num = max_q_in_batch
             time.sleep(1)
 
         progress_bar.progress(1.0, text="Batch processing complete!")
@@ -256,7 +276,7 @@ def create_streamlit_app():
     st.set_page_config(page_title="AI Survey Renumbering Tool", layout="wide")
     
     st.title("📊 AI-Powered Survey Renumbering Tool")
-    st.markdown("Automate survey column renumbering by matching a dataset (CSV/Excel) with a survey report (PDF).")
+    st.markdown("Automate survey column renumbering by matching a dataset (CSV/Excel) with a survey report (PDF). Now with support for monadic studies!")
     st.markdown("---")
 
     if 'review_df' not in st.session_state: st.session_state.review_df = None
