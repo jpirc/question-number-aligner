@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import streamlit as st
 import io
 import os
+from collections import defaultdict
 
 # --- Data Classes ---
 @dataclass
@@ -37,6 +38,28 @@ class QuestionNumberAligner:
             st.stop()
         return api_key
 
+    def _analyze_column_patterns(self, column_headers: List[str]) -> Dict[str, List[int]]:
+        """
+        Analyzes column headers to find groups based on common prefixes.
+        e.g., ['Q1_a', 'Q1_b', 'Q2'] -> {'Q1_': [0, 1]}
+        """
+        groups = defaultdict(list)
+        # Regex to find a prefix ending in a common delimiter (_, -, .)
+        # It looks for a sequence of non-delimiter characters followed by a delimiter.
+        prefix_regex = re.compile(r'^(.+?[\W_])') 
+
+        for i, header in enumerate(column_headers):
+            match = prefix_regex.match(header)
+            if match:
+                prefix = match.group(1)
+                # To avoid grouping things like "Question 1", "Question 2"
+                # we can add a simple heuristic: the prefix should not end with a digit followed by the delimiter.
+                if not prefix[-2].isdigit():
+                    groups[prefix].append(i)
+        
+        # Filter out groups with only one member, as they aren't groups.
+        return {prefix: indices for prefix, indices in groups.items() if len(indices) > 1}
+
     def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
         """
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
@@ -56,19 +79,11 @@ class QuestionNumberAligner:
         4. Clean the extracted text to form a single, coherent sentence. Remove any line breaks or formatting noise.
         5. Assemble the results into a single, valid JSON object. The object should contain one key, "questions", which holds an array of objects. Each object in the array must have two keys: "question_number" (as a string) and "question_text" (the cleaned text).
 
-        **CRITICAL INSTRUCTION:** Do not be deterred by messy tables or complex layouts. If you see "39. Please rank the following...", you MUST extract it. Your job is to find the numbered question text itself, no matter what.
-
         Example of a perfect response:
         {
           "questions": [
-            {
-              "question_number": "39",
-              "question_text": "HOH BDAY - Please rank the following factors from most to least appealing to when considering a kitchen renovation."
-            },
-            {
-              "question_number": "40",
-              "question_text": "HOH BDAY - Which one of the two taglines do you like the most for this campaign?"
-            }
+            { "question_number": "39", "question_text": "HOH BDAY - Please rank the following factors from most to least appealing to when considering a kitchen renovation." },
+            { "question_number": "40", "question_text": "HOH BDAY - Which one of the two taglines do you like the most for this campaign?" }
           ]
         }
 
@@ -95,7 +110,6 @@ class QuestionNumberAligner:
             questions = [Question(number=str(q['question_number']), text=q['question_text']) 
                          for q in question_data.get('questions', [])]
             
-            # Sort questions numerically
             return sorted(questions, key=lambda q: int(re.search(r'\d+', q.number).group() if re.search(r'\d+', q.number) else 0))
 
         except requests.exceptions.RequestException as e:
@@ -117,8 +131,12 @@ class QuestionNumberAligner:
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
+        # **NEW**: Analyze column patterns first
+        column_groups = self._analyze_column_patterns(column_headers)
+        
         questions_json_str = json.dumps([q.__dict__ for q in questions], indent=2)
         formatted_columns = "\n".join([f'{i}: "{header}"' for i, header in enumerate(column_headers)])
+        formatted_groups = json.dumps(column_groups, indent=2)
 
         prompt = f"""
         You are an expert market research data analyst. Your task is to map a list of raw dataset column headers to a structured list of survey questions.
@@ -126,21 +144,26 @@ class QuestionNumberAligner:
         **CRITICAL INSTRUCTIONS:**
         1.  **High Accuracy Over Completeness:** It is MANDATORY to be accurate. If you are not highly confident in a match, you MUST assign "UNMATCHED". It is better to leave a column unmatched than to assign it an incorrect question number.
         2.  **Strict Order Preservation:** The final output MUST be an array of objects that corresponds exactly to the original order of the input column headers, from index 0 to {len(column_headers) - 1}. Do not reorder the columns.
-        3.  **Handle Complex Questions:**
-            * **Multi-Select/Matrix:** Multiple columns often belong to a single question (e.g., "Q5 - Red", "Q5 - Blue", "Q5 - Green"). Assign the SAME question number (e.g., "Q5") to ALL columns that are part of that group. Use the base text of the column header before the hyphen or delimiter to identify the group.
-            * **Open-Ends & "Other, Specify":** Columns like "Q5_other_specify" or "Q6_comment" belong to their parent question. Assign them the parent question number (e.g., "Q5" or "Q6").
+        3.  **Handle Complex Questions & Groups:** I have pre-analyzed the column headers and identified likely groups (matrix questions, multi-selects). You MUST use this information. When a group is identified, assign the SAME question number to ALL columns in that group.
         4.  **No Forced Matches:** Do NOT match internal system variables, metadata, or programming notes (e.g., 'record_id', 'start_time', 'end_time', 'device_type', 'user_ip', 'weight'). Assign these "UNMATCHED".
-        5.  **Output Format:** Your entire response must be ONLY a single JSON object. Do not include any text, code block markers, or explanations outside of the JSON. The JSON object must have a single key, "column_mapping", which is an array of objects. Each object in the array represents a column and must have these four keys: "column_index" (integer), "original_header" (string), "assigned_question" (string, either the question number or "UNMATCHED"), and "reasoning" (a brief string explaining your decision).
+        5.  **Output Format:** Your entire response must be ONLY a single JSON object. Do not include any text, code block markers, or explanations outside of the JSON. The JSON object must have a single key, "column_mapping", which is an array of objects. Each object must have four keys: "column_index" (integer), "original_header" (string), "assigned_question" (string, either the question number or "UNMATCHED"), and "reasoning" (a brief string explaining your decision).
 
         ---
         **INPUT DATA**
+
         **1. Survey Questions (JSON Format):**
         {questions_json_str}
+
         **2. Dataset Column Headers (Index: "Header"):**
         {formatted_columns}
+
+        **3. Pre-Analyzed Column Groups (Prefix: [Column Indices]):**
+        These columns likely belong together as part of a single complex question.
+        {formatted_groups}
+
         ---
         **YOUR TASK**
-        Analyze the two inputs and generate the JSON output mapping every single column header from the list provided, following all instructions precisely.
+        Analyze all inputs and generate the JSON output mapping every single column header from the list provided, following all instructions precisely. Prioritize the pre-analyzed groups.
         """
 
         payload = {
@@ -150,7 +173,7 @@ class QuestionNumberAligner:
         
         extracted_json_text = ""
         try:
-            with st.spinner("AI is matching questions to columns... This may take a moment."):
+            with st.spinner("AI is matching questions to columns (with pattern analysis)... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
                 response.raise_for_status()
             response_json = response.json()
