@@ -3,7 +3,7 @@ import re
 import json
 import base64
 import requests
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import streamlit as st
@@ -50,7 +50,7 @@ class QuestionNumberAligner:
             st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
             return []
 
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -69,7 +69,9 @@ class QuestionNumberAligner:
           "1": "To which gender identity do you most identify? Select one.",
           "3": "What is your age?",
           "4": "What region of the country do you currently live in?",
-          "6": "Which of the following do you currently own? Select al that apply."
+          "6": "Which of the following do you currently own? Select all that apply.",
+          "12": "HOH BDAY - How much do you like this ad?",
+          "46": "HOH PUP - How much do you like this ad?"
         }
         """
         
@@ -98,7 +100,8 @@ class QuestionNumberAligner:
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             st.error(f"Error parsing response from Gemini API: {e}")
             st.error("The API may have returned an unexpected format. Check the raw response:")
-            st.json(response.json())
+            if 'response' in locals():
+                st.json(response.json())
             return []
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}")
@@ -133,53 +136,77 @@ class QuestionNumberAligner:
                     used_columns.update(current_group)
         return groups
 
-    def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Dict[str, str]:
+    def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Tuple[Dict[str, str], Dict[str, float]]:
+        """Returns both mapping and confidence scores"""
         columns = list(df.columns)
         mapping = {}
-        used_question_nums = set()
-
+        confidence_scores = {}
+        
+        # Don't track used questions - allow reuse for repeated questions (ad variants)
         multi_groups = self.find_multi_response_groups(columns)
+        
+        # Process multi-response groups
         for base_question, group_cols in multi_groups.items():
             clean_base = self.clean_column_name(base_question)
             best_match_q, highest_score = None, 0.0
+            
             for q in questions:
-                if q.number in used_question_nums: continue
                 score = self.calculate_similarity(clean_base, q.text)
-                if q.question_type == 'multi': score += 0.2
+                if q.question_type == 'multi': 
+                    score += 0.2
                 if score > highest_score:
                     highest_score, best_match_q = score, q
+                    
             if best_match_q and highest_score > 0.3:
                 for col in group_cols:
                     mapping[col] = best_match_q.number
-                used_question_nums.add(best_match_q.number)
+                    confidence_scores[col] = highest_score
 
+        # Process remaining columns
         for col in columns:
-            if col in mapping: continue
+            if col in mapping: 
+                continue
+                
             clean_col = self.clean_column_name(col)
             best_match_q, highest_score = None, 0.0
+            
             for q in questions:
-                if q.number in used_question_nums: continue
                 score = self.calculate_similarity(clean_col, q.text)
+                
+                # Boost score for demographic matches
                 if any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns) and \
                    any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
                     score += 0.3
+                    
                 if score > highest_score:
                     highest_score, best_match_q = score, q
+                    
             if best_match_q and highest_score > 0.4:
                 mapping[col] = best_match_q.number
-                if highest_score > 0.7: used_question_nums.add(best_match_q.number)
+                confidence_scores[col] = highest_score
             else:
                 mapping[col] = 'UNMATCHED'
-        return mapping
+                confidence_scores[col] = 0.0
+                
+        return mapping, confidence_scores
 
-    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str) -> pd.DataFrame:
+    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str, include_unmatched: bool = True) -> pd.DataFrame:
+        """Apply numbering with option to exclude unmatched columns"""
         df_numbered = df.copy()
-        new_columns = {
-            col: f"{prefix_format.format(num=mapping.get(col))}{col}"
-            if mapping.get(col) and mapping[col] not in ['UNMATCHED'] and mapping[col].isdigit()
-            else col
-            for col in df_numbered.columns
-        }
+        
+        if not include_unmatched:
+            # Filter out unmatched columns
+            matched_cols = [col for col in df.columns if mapping.get(col, 'UNMATCHED') != 'UNMATCHED']
+            df_numbered = df_numbered[matched_cols]
+        
+        # Rename columns with question numbers
+        new_columns = {}
+        for col in df_numbered.columns:
+            if col in mapping and mapping[col] != 'UNMATCHED' and mapping[col].isdigit():
+                new_columns[col] = f"{prefix_format.format(num=mapping[col])}{col}"
+            else:
+                new_columns[col] = col
+                
         df_numbered.rename(columns=new_columns, inplace=True)
         return df_numbered
 
@@ -191,12 +218,15 @@ def create_streamlit_app():
     st.markdown("This tool uses AI to read a survey PDF, extract the questions, and match them to your dataset columns.")
     st.markdown("---")
 
+    # Initialize session state
     if 'mapping' not in st.session_state: st.session_state.mapping = None
+    if 'confidence_scores' not in st.session_state: st.session_state.confidence_scores = None
     if 'df' not in st.session_state: st.session_state.df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
     
     aligner = QuestionNumberAligner()
 
+    # Step 1: File Upload
     st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
     with col1:
@@ -212,6 +242,18 @@ def create_streamlit_app():
             st.error(f"Error loading dataset: {e}")
             st.session_state.df = None
 
+    # Load Previous Mapping Option
+    with st.expander("📂 Load Previous Mapping (Optional)"):
+        uploaded_mapping = st.file_uploader("Load a saved mapping file", type=['json'])
+        if uploaded_mapping:
+            try:
+                loaded_mapping = json.loads(uploaded_mapping.read())
+                st.session_state.mapping = loaded_mapping
+                st.success("✅ Previous mapping loaded successfully!")
+            except Exception as e:
+                st.error(f"Error loading mapping: {e}")
+
+    # Step 2: Extract Questions
     st.markdown("---")
     st.subheader("Step 2: Extract Questions from PDF")
     if pdf_file:
@@ -228,83 +270,156 @@ def create_streamlit_app():
 
     if st.session_state.questions:
         with st.expander("📋 Review Extracted Questions"):
-            st.json({q.number: q.text for q in st.session_state.questions})
+            question_dict = {q.number: q.text for q in st.session_state.questions}
+            st.json(question_dict)
 
+    # Step 3: Run Alignment
     if st.session_state.df is not None and st.session_state.questions:
         st.markdown("---")
-        st.subheader("Step 3: Run Alignment & Export")
+        st.subheader("Step 3: Run Alignment")
         if st.button("🚀 Run Automatic Alignment", use_container_width=True):
             with st.spinner("Analyzing and matching columns..."):
-                st.session_state.mapping = aligner.match_columns_to_questions(st.session_state.df, st.session_state.questions)
+                mapping, confidence_scores = aligner.match_columns_to_questions(st.session_state.df, st.session_state.questions)
+                st.session_state.mapping = mapping
+                st.session_state.confidence_scores = confidence_scores
     
+    # Display Results
     if st.session_state.mapping:
         st.markdown("---")
         st.subheader("📋 Alignment Results")
         
-        # Create a lookup dictionary for question text
+        # Create question lookup and dropdown options
         question_lookup = {q.number: q.text for q in st.session_state.questions}
         
+        # Create dropdown options: "Qnum. Question text" format
+        question_options = ['UNMATCHED'] + [f"Q{num}. {text}" for num, text in sorted(question_lookup.items(), key=lambda x: int(x[0]))]
+        
+        # Summary metrics
+        total_cols = len(st.session_state.df.columns)
+        matched_cols = sum(1 for v in st.session_state.mapping.values() if v != 'UNMATCHED')
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Columns", total_cols)
+        with col2:
+            st.metric("Matched", matched_cols, f"{matched_cols/total_cols*100:.1f}%")
+        with col3:
+            st.metric("Unmatched", total_cols - matched_cols)
+        
+        st.markdown("##### Review and Edit Mappings")
+        st.info("💡 Tip: Click on any dropdown in the 'Select Question' column to change the matched question.")
+        
+        # Create review dataframe
         review_data = []
         for col in st.session_state.df.columns:
             q_num = st.session_state.mapping.get(col, 'UNMATCHED')
-            status = '✅ Matched' if str(q_num).isdigit() else '❌ Unmatched'
+            confidence = st.session_state.confidence_scores.get(col, 0.0)
             
-            # Prepend the question number to the text for easy review
-            if status == '✅ Matched':
-                matched_text = f"Q{q_num}. {question_lookup.get(q_num, 'Text not found.')}"
+            # Create current selection for dropdown
+            if q_num != 'UNMATCHED':
+                current_selection = f"Q{q_num}. {question_lookup.get(q_num, 'Text not found')}"
             else:
-                matched_text = "N/A - Unmatched"
+                current_selection = 'UNMATCHED'
             
             review_data.append({
                 'Column Name': col,
-                'Matched Question Text': matched_text,
-                'Assigned Question': str(q_num),
-                'Status': status
+                'Current Match': current_selection,
+                'Confidence': confidence,
+                'Select Question': current_selection
             })
         
-        review_df = pd.DataFrame(review_data).set_index('Column Name')
+        review_df = pd.DataFrame(review_data)
         
-        st.markdown("##### Review and Edit Mappings")
-        st.info("Review the AI's matches below. You can manually correct the 'Assigned Question' number for any column.")
-        
-        # Reorder columns for better review flow
-        column_order = ["Matched Question Text", "Assigned Question", "Status"]
-        
+        # Use column configuration for better display
         edited_df = st.data_editor(
-            review_df[column_order],
+            review_df,
             column_config={
-                "Matched Question Text": st.column_config.TextColumn("Matched Question Text", width="large", help="The question text matched by the AI.", disabled=True),
-                "Assigned Question": st.column_config.TextColumn("Assigned Question", help="Edit the question number here if the match is incorrect."),
-                "Status": st.column_config.TextColumn("Status", disabled=True)
+                "Column Name": st.column_config.TextColumn("Column Name", width="large", disabled=True),
+                "Current Match": st.column_config.TextColumn("Current Match", width="large", disabled=True),
+                "Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1, format="%.0%"),
+                "Select Question": st.column_config.SelectboxColumn(
+                    "Select Question",
+                    help="Choose the correct question for this column",
+                    options=question_options,
+                    width="large"
+                )
             },
             use_container_width=True,
+            hide_index=True,
             height=400
         )
-
-        for col_name, row in edited_df.iterrows():
-            st.session_state.mapping[col_name] = row['Assigned Question']
-
-        st.markdown("##### Export Your Renumbered Dataset")
-        prefix_format = st.selectbox(
-            "Question Number Format",
-            ["Q{num}. ", "{num}. ", "#{num}. ", "Question {num}: "],
-            help="Choose how question numbers are prefixed to column names."
+        
+        # Update mapping based on edits
+        for idx, row in edited_df.iterrows():
+            selection = row['Select Question']
+            if selection == 'UNMATCHED':
+                st.session_state.mapping[row['Column Name']] = 'UNMATCHED'
+            else:
+                # Extract question number from selection (format: "Q123. Question text")
+                q_num = selection.split('.')[0].replace('Q', '')
+                st.session_state.mapping[row['Column Name']] = q_num
+        
+        # Export section
+        st.markdown("---")
+        st.subheader("📥 Export Options")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            prefix_format = st.selectbox(
+                "Question Number Format",
+                ["Q{num}. ", "{num}. ", "#{num}. ", "Question {num}: "],
+                help="Choose how question numbers are prefixed to column names."
+            )
+        with col2:
+            include_unmatched = st.checkbox("Include unmatched columns", value=True)
+        
+        # Generate final dataset
+        final_df = aligner.apply_numbering_to_dataset(
+            st.session_state.df, 
+            st.session_state.mapping, 
+            prefix_format,
+            include_unmatched
         )
         
-        final_df = aligner.apply_numbering_to_dataset(st.session_state.df, st.session_state.mapping, prefix_format)
+        # Export buttons
+        col1, col2, col3 = st.columns(3)
         
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            final_df.to_excel(writer, index=False, sheet_name='Numbered Data')
-        excel_data = output.getvalue()
+        with col1:
+            # Excel export
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                final_df.to_excel(writer, index=False, sheet_name='Numbered Data')
+            excel_data = output.getvalue()
 
-        st.download_button(
-            label="📑 Download Renumbered Dataset (Excel)",
-            data=excel_data,
-            file_name="renumbered_dataset.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+            st.download_button(
+                label="📑 Download Excel",
+                data=excel_data,
+                file_name="renumbered_dataset.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        
+        with col2:
+            # CSV export
+            csv = final_df.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="📄 Download CSV",
+                data=csv,
+                file_name="renumbered_dataset.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        
+        with col3:
+            # Save mapping
+            mapping_json = json.dumps(st.session_state.mapping, indent=2)
+            st.download_button(
+                label="💾 Save Mapping",
+                data=mapping_json,
+                file_name="question_mapping.json",
+                mime="application/json",
+                use_container_width=True,
+                help="Save this mapping to reuse with similar surveys"
+            )
 
 if __name__ == "__main__":
     create_streamlit_app()
