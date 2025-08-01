@@ -38,23 +38,6 @@ class QuestionNumberAligner:
             st.stop()
         return api_key
 
-    def _analyze_column_patterns(self, column_headers: List[str]) -> Dict[str, List[int]]:
-        """
-        Analyzes column headers to find groups based on common prefixes.
-        e.g., ['Q1_a', 'Q1_b', 'Q2'] -> {'Q1_': [0, 1]}
-        """
-        groups = defaultdict(list)
-        prefix_regex = re.compile(r'^(.+?[\W_])') 
-
-        for i, header in enumerate(column_headers):
-            match = prefix_regex.match(header)
-            if match:
-                prefix = match.group(1)
-                if len(prefix) > 1 and not prefix[-2].isdigit():
-                    groups[prefix].append(i)
-        
-        return {prefix: indices for prefix, indices in groups.items() if len(indices) > 1}
-
     def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
         """
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
@@ -131,34 +114,32 @@ class QuestionNumberAligner:
 
     def match_with_gemini(self, questions: List[Question], column_headers: List[str]) -> Dict[str, Dict[str, str]]:
         """
-        Uses Gemini 1.5 Pro with a compressed, specialized prompt to match columns to questions.
+        Uses Gemini 1.5 Pro with a simplified, robust prompt to match columns to questions.
         Returns a dictionary mapping column index to its match info.
         """
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
-        column_groups = self._analyze_column_patterns(column_headers)
-        grouped_indices = set(idx for indices in column_groups.values() for idx in indices)
-        individual_columns = {i: header for i, header in enumerate(column_headers) if i not in grouped_indices}
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions])
-        formatted_groups = json.dumps(column_groups, separators=(',', ':'))
-        formatted_individual_columns = json.dumps(individual_columns, separators=(',', ':'))
+        # Send all column headers for the AI to analyze contextually
+        formatted_columns = "\n".join([f'{i}: "{header}"' for i, header in enumerate(column_headers)])
 
         prompt = f"""
         You are an expert market research data analyst. Your task is to map dataset columns to survey questions.
 
         **CRITICAL INSTRUCTIONS:**
         1.  **Accuracy is Mandatory:** If not highly confident, assign "UNMATCHED".
-        2.  **Handle Groups:** For "Pre-Analyzed Column Groups", assign the SAME question number to ALL columns in that group.
-        3.  **Handle Individuals:** Match "Individual Columns" to the most appropriate question from the "Survey Questions" list.
-        4.  **No Forced Matches:** Assign "UNMATCHED" to system variables.
-        5.  **Output Format:** Your response MUST be a single JSON object with one key, "mapping". The value is another object where each key is a `column_index` (as a string) and the value is an object with two keys: "assigned_question" (string) and "reasoning" (string).
+        2.  **Handle Multi-Part Questions:** Look at the column headers. If multiple columns clearly belong to the same question (e.g., "Q5 - Option A", "Q5 - Option B"), you MUST assign the SAME question number to all of them.
+        3.  **No Forced Matches:** Assign "UNMATCHED" to system variables (e.g., 'Response ID').
+        4.  **Output Format:** Your response MUST be a single JSON object with one key, "mapping". The value is another object where each key is a `column_index` (as a string) and the value is an object with two keys: "assigned_question" and "reasoning".
+        5.  **Assigned Question VALUE:** For the "assigned_question" key, you MUST return ONLY the question number (e.g., "1", "3", "42a") or the literal string "UNMATCHED". DO NOT return the full question text.
 
         Example Response Snippet:
         {{
           "mapping": {{
             "0": {{"assigned_question": "UNMATCHED", "reasoning": "System variable."}},
-            "1": {{"assigned_question": "1.", "reasoning": "Matches question about gender identity."}}
+            "1": {{"assigned_question": "1", "reasoning": "Matches question about gender identity."}},
+            "2": {{"assigned_question": "1", "reasoning": "Specify option for question 1."}}
           }}
         }}
 
@@ -166,10 +147,9 @@ class QuestionNumberAligner:
         **INPUT DATA**
         1. Survey Questions (Number: Text):
         {compact_questions}
-        2. Pre-Analyzed Column Groups (Prefix: [Column Indices]):
-        {formatted_groups}
-        3. Individual Columns (Index: Header):
-        {formatted_individual_columns}
+
+        2. Dataset Column Headers (Index: Header):
+        {formatted_columns}
         ---
         **YOUR TASK**
         Analyze all inputs and generate the JSON output mapping ALL original column indices to their corresponding question number.
@@ -187,7 +167,7 @@ class QuestionNumberAligner:
         }
         
         try:
-            with st.spinner("AI is matching questions to columns (with robust reconstruction)... This may take a moment."):
+            with st.spinner("AI is matching questions to columns (Simplified, Robust Method)... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
                 response.raise_for_status()
             response_json = response.json()
