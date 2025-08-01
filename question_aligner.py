@@ -26,24 +26,6 @@ def index_to_excel_col(idx: int) -> str:
         idx = idx // 26 - 1
     return col
 
-def sanitize_json_string(json_str: str) -> str:
-    """
-    Attempts to clean up a potentially malformed JSON string from an LLM.
-    - Slices the string to the first '{' and last '}'
-    - Removes trailing commas that cause parsing errors
-    """
-    try:
-        start = json_str.find('{')
-        end = json_str.rfind('}')
-        if start == -1 or end == -1:
-            return "" 
-        
-        json_str = json_str[start:end+1]
-        json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
-        return json_str
-    except Exception:
-        return ""
-
 # --- Core Logic Class ---
 class QuestionNumberAligner:
     """Handles the logic for parsing and matching questions using the Gemini AI."""
@@ -127,8 +109,11 @@ class QuestionNumberAligner:
             st.error(f"An unexpected error occurred during AI Question Extraction: {e}")
             return []
 
-    def _match_batch_with_gemini(self, questions: List[Question], column_batch: Dict[int, str]) -> Dict[str, Any]:
-        """Processes a single batch of columns against the full list of questions."""
+    def _match_batch_with_gemini(self, questions: List[Question], column_batch: Dict[int, str]) -> str:
+        """
+        Processes a single batch of columns and returns a simple pipe-delimited string.
+        Returns an empty string on failure.
+        """
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
@@ -140,19 +125,15 @@ class QuestionNumberAligner:
 
         **CRITICAL INSTRUCTIONS:**
         1.  **Accuracy is Mandatory:** If not highly confident, assign "UNMATCHED".
-        2.  **Handle Multi-Part Questions:** Look at the column headers. If multiple columns clearly belong to the same question (e.g., "Q5 - Option A", "Q5 - Option B"), you MUST assign the SAME question number to all of them.
+        2.  **Handle Multi-Part Questions:** If multiple columns belong to the same question (e.g., "Q5 - Option A", "Q5 - Option B"), assign the SAME question number to all of them.
         3.  **No Forced Matches:** Assign "UNMATCHED" to system variables (e.g., 'Response ID').
-        4.  **Output Format:** Your response MUST be a single JSON object with one key, "mapping". The value is another object where each key is a `column_index` from the input batch (as a string) and the value is an object with two keys: "assigned_question" and "reasoning".
-        5.  **Assigned Question VALUE:** For the "assigned_question" key, you MUST return ONLY the question number (e.g., "1", "3", "42a") or the literal string "UNMATCHED".
+        4.  **Output Format:** Your response MUST be plain text. Each line MUST follow this exact format: `column_index|assigned_question|reasoning`. Use the pipe `|` character as a delimiter. Do not output JSON or any other format.
+        5.  **Assigned Question VALUE:** For the "assigned_question" part, you MUST return ONLY the question number (e.g., "1", "3", "42a") or the literal string "UNMATCHED".
 
-        Example Response Snippet for a batch:
-        {{
-          "mapping": {{
-            "150": {{"assigned_question": "UNMATCHED", "reasoning": "System variable."}},
-            "151": {{"assigned_question": "25", "reasoning": "Matches question about social media usage."}},
-            "152": {{"assigned_question": "25", "reasoning": "Option for question 25."}}
-          }}
-        }}
+        Example Response:
+        150|UNMATCHED|System variable.
+        151|25|Matches question about social media usage.
+        152|25|Option for question 25.
 
         ---
         **INPUT DATA**
@@ -163,12 +144,12 @@ class QuestionNumberAligner:
         {formatted_columns}
         ---
         **YOUR TASK**
-        Analyze the inputs and generate the JSON output mapping ALL column indices in the provided batch to their corresponding question number.
+        Analyze the inputs and generate the pipe-delimited text output mapping ALL column indices in the provided batch.
         """
 
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json"},
+            "generationConfig": {"responseMimeType": "text/plain"}, # Ask for plain text
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -177,46 +158,30 @@ class QuestionNumberAligner:
             ]
         }
         
-        extracted_json_text = ""
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
             response.raise_for_status()
             response_json = response.json()
 
             if not response_json.get('candidates'):
-                st.error(f"AI Matching Failed for a batch: The API returned no candidates. This is likely due to the prompt being blocked by safety filters.")
-                return {}
+                st.error(f"AI Matching Failed for a batch: The API returned no candidates.")
+                return ""
 
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
-            extracted_json_text = content_part.get('text', '').strip()
-            
-            # **NEW**: Sanitize the JSON string before parsing
-            cleaned_json_text = sanitize_json_string(extracted_json_text)
-            
-            if not cleaned_json_text:
-                st.error(f"Error: AI response for a batch was malformed and could not be sanitized.")
-                st.text_area("Raw Malformed Response", value=extracted_json_text, height=150)
-                return {}
-
-            match_results = json.loads(cleaned_json_text)
-            return match_results.get('mapping', {})
+            return content_part.get('text', '').strip()
 
         except requests.exceptions.RequestException as e:
             st.error(f"A network error occurred during a batch match: {e}")
-            return {}
-        except json.JSONDecodeError as e:
-            st.error(f"Error parsing AI response for a batch. Error: {e}")
-            st.text_area("Raw AI Response That Failed Parsing", value=extracted_json_text, height=200)
-            return {}
+            return ""
         except Exception as e:
             st.error(f"An unexpected error occurred during a batch match: {e}")
-            return {}
+            return ""
 
     def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = 150) -> Dict[str, Dict[str, str]]:
         """
-        Orchestrates the matching process by splitting columns into batches
-        and calling the AI for each batch.
+        Orchestrates the matching process by splitting columns into batches,
+        calling the AI for each batch, and parsing the simple text response.
         """
         full_mapping = {}
         num_batches = (len(column_headers) + batch_size - 1) // batch_size
@@ -232,14 +197,27 @@ class QuestionNumberAligner:
             progress_text = f"Processing batch {i+1} of {num_batches} (Columns {start_index}-{end_index-1})..."
             progress_bar.progress((i) / num_batches, text=progress_text)
             
-            batch_mapping = self._match_batch_with_gemini(questions, column_batch_dict)
+            # The AI now returns a simple string
+            response_string = self._match_batch_with_gemini(questions, column_batch_dict)
             
-            if not batch_mapping:
-                st.error(f"Batch {i+1} failed. Stopping process. Please review errors.")
+            if not response_string:
+                st.error(f"Batch {i+1} failed: Received an empty response from the AI. Stopping process.")
                 progress_bar.empty()
                 return {}
 
-            full_mapping.update(batch_mapping)
+            # **NEW**: Parse the simple string response in Python
+            for line in response_string.split('\n'):
+                parts = line.strip().split('|')
+                if len(parts) == 3:
+                    col_idx, assigned_q, reasoning = parts
+                    full_mapping[col_idx] = {
+                        "assigned_question": assigned_q,
+                        "reasoning": reasoning
+                    }
+                else:
+                    # This handles cases where a line might be malformed, preventing a crash.
+                    st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
+
             time.sleep(1)
 
         progress_bar.progress(1.0, text="Batch processing complete!")
