@@ -180,11 +180,20 @@ class QuestionNumberAligner:
 
     def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = 150) -> Dict[str, Dict[str, str]]:
         """
-        Orchestrates the stateful, sequential matching process.
+        Orchestrates the stateful, sequential matching process with a focused question window.
         """
         full_mapping = {}
         last_matched_q_num = 0
-        question_lookup = {int(re.search(r'\d+', q.number).group()): q for q in questions if re.search(r'\d+', q.number)}
+        
+        # Create a lookup dictionary from question number to Question object
+        # This handles non-integer question numbers like 'Q1' or '1a' by extracting the first integer
+        question_lookup = {}
+        for q in questions:
+            match = re.search(r'\d+', q.number)
+            if match:
+                question_lookup[int(match.group())] = q
+        
+        # A sorted list of the integer question numbers
         question_indices = sorted(question_lookup.keys())
 
         num_batches = (len(column_headers) + batch_size - 1) // batch_size
@@ -197,17 +206,23 @@ class QuestionNumberAligner:
             
             column_batch_dict = {start_index + j: header for j, header in enumerate(batch_headers)}
 
-            # Create a "window" of questions for the AI to consider
-            window_start_q_num = max(0, last_matched_q_num - 5) # Look back a little
-            
-            # Find the index in our sorted list to start the window from
+            # --- NEW: Focused Question Window Logic ---
+            # Find the index in our sorted list where we should start looking for questions
             window_start_index = 0
             for idx, q_num in enumerate(question_indices):
-                if q_num >= window_start_q_num:
+                # Start the window from the last matched question number
+                if q_num > last_matched_q_num:
                     window_start_index = idx
                     break
             
-            questions_window = [question_lookup[q_num] for q_num in question_indices[window_start_index:]]
+            # Define the end of the window to keep the prompt focused
+            window_end_index = min(window_start_index + 40, len(question_indices)) # Look at the next 40 questions
+            
+            # Slice the list of question numbers to get our window
+            questions_in_window_indices = question_indices[window_start_index:window_end_index]
+            
+            # Get the actual Question objects for the window
+            questions_window = [question_lookup[q_num] for q_num in questions_in_window_indices]
 
             progress_text = f"Processing batch {i+1}/{num_batches} (Context: Start from Q{last_matched_q_num+1})"
             progress_bar.progress((i) / num_batches, text=progress_text)
@@ -228,7 +243,6 @@ class QuestionNumberAligner:
                         "assigned_question": assigned_q_str,
                         "reasoning": reasoning
                     }
-                    # Update the last matched question number
                     match = re.search(r'\d+', assigned_q_str)
                     if match:
                         current_q_num = int(match.group())
@@ -237,7 +251,10 @@ class QuestionNumberAligner:
                 else:
                     st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
             
-            last_matched_q_num = max_q_in_batch
+            # Only update if the AI found a new higher number
+            if max_q_in_batch > last_matched_q_num:
+                last_matched_q_num = max_q_in_batch
+            
             time.sleep(1)
 
         progress_bar.progress(1.0, text="Batch processing complete!")
