@@ -18,6 +18,15 @@ class Question:
     text: str
     question_type: str
 
+# --- Helper Functions ---
+def index_to_excel_col(idx: int) -> str:
+    """Converts a zero-based column index to an Excel-style column letter (A, B, ... Z, AA, AB...)."""
+    col = ""
+    while idx >= 0:
+        col = chr(idx % 26 + 65) + col
+        idx = idx // 26 - 1
+    return col
+
 # --- Core Logic Class ---
 class QuestionNumberAligner:
     """Handles the logic for parsing questions using AI and matching them to dataset columns."""
@@ -139,91 +148,100 @@ class QuestionNumberAligner:
     def calculate_similarity(self, str1: str, str2: str) -> float:
         return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
 
-    def find_multi_response_groups(self, columns: List[str]) -> Dict[str, List[str]]:
-        groups = {}
-        used_columns = set()
-        for col in columns:
-            if col in used_columns: continue
-            if ' - ' in col:
-                base_question = col.split(' - ')[0].strip()
-                if len(base_question) < 10: continue
-                current_group = [c for c in columns if c.startswith(base_question + ' - ')]
-                if len(current_group) > 1:
-                    groups[base_question] = current_group
-                    used_columns.update(current_group)
-        return groups
-
     def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Tuple[Dict[str, str], Dict[str, float]]:
         """
-        Returns mapping and confidence scores with a more robust, self-correcting sequential algorithm.
+        A more robust, two-pass matching algorithm using "anchoring" and "interpolation".
         """
         columns = list(df.columns)
-        mapping = {}
-        confidence_scores = {}
+        mapping = {col: 'UNMATCHED' for col in columns}
+        confidence_scores = {col: 0.0 for col in columns}
         
         sorted_questions = sorted(questions, key=lambda q: int(q.number))
+        q_lookup = {q.number: q for q in sorted_questions}
         
-        # --- Pass 1: Handle Multi-Select Groups ---
-        multi_groups = self.find_multi_response_groups(columns)
-        for base_question, group_cols in multi_groups.items():
-            clean_base = self.clean_column_name(base_question)
-            best_match_q, highest_score = None, 0.0
-            
-            for q in questions:
-                # Only match multi-select groups to questions identified as multi-response
-                if q.question_type != 'multi': continue
-                
-                score = self.calculate_similarity(clean_base, q.text)
-                if score > highest_score:
-                    highest_score, best_match_q = score, q
-                    
-            if best_match_q and highest_score > 0.70: # Stricter 70% threshold
-                for col in group_cols:
-                    mapping[col] = best_match_q.number
-                    confidence_scores[col] = highest_score
-
-        # --- Pass 2: Handle Single Columns with Self-Correcting Logic ---
-        unmapped_columns = [col for col in columns if col not in mapping]
-        question_index = 0 # Our current position in the sorted_questions list
-        
-        for col in unmapped_columns:
+        # --- Pass 1: High-Confidence Anchoring ---
+        # Find near-perfect matches to act as reliable guideposts.
+        anchors = []
+        for i, col in enumerate(columns):
             clean_col = self.clean_column_name(col)
-            best_match_q, highest_score = None, 0.0
-            best_q_idx = -1
-            
-            # Define a "look-ahead" window to prevent illogical jumps
-            look_ahead_window = 20
-            search_end_index = min(question_index + look_ahead_window, len(sorted_questions))
-            search_window = sorted_questions[question_index:search_end_index]
-            
-            for q_idx_in_window, q in enumerate(search_window):
-                actual_q_idx = question_index + q_idx_in_window
+            for j, q in enumerate(sorted_questions):
                 score = self.calculate_similarity(clean_col, q.text)
+                if score > 0.95: # Very high confidence for an anchor
+                    anchors.append({'col_idx': i, 'q_idx': j, 'q_num': q.number, 'score': score})
+                    break # Assume first great match is the one
+
+        # --- Pass 2: Interpolation between Anchors ---
+        # Add start and end points to process the whole list
+        proc_anchors = [{'col_idx': -1, 'q_idx': -1}] + anchors + [{'col_idx': len(columns), 'q_idx': len(sorted_questions)}]
+
+        for i in range(len(proc_anchors) - 1):
+            start_anchor = proc_anchors[i]
+            end_anchor = proc_anchors[i+1]
+
+            # Define the segment of columns and questions to work on
+            col_segment = columns[start_anchor['col_idx']+1 : end_anchor['col_idx']]
+            q_segment = sorted_questions[start_anchor['q_idx']+1 : end_anchor['q_idx']]
+
+            if not col_segment or not q_segment:
+                continue
+
+            # --- Sub-Pass 2a: Multi-Select Grouping within the segment ---
+            col_cursor = 0
+            while col_cursor < len(col_segment):
+                col = col_segment[col_cursor]
+                base_question = col.split(' - ')[0].strip()
                 
-                # Proximity bonus for questions that appear in the expected order
-                proximity_bonus = max(0, 1 - (q_idx_in_window / look_ahead_window)) * 0.2
-                score += proximity_bonus
-                    
-                if score > highest_score:
-                    highest_score, best_match_q = score, q
-                    best_q_idx = actual_q_idx
+                # Check if this column is part of a multi-select group
+                if ' - ' in col and len(base_question) > 10:
+                    group_cols = [c for c in col_segment if c.startswith(base_question + ' - ')]
+                    if len(group_cols) > 1:
+                        # Find the best match for this group within the question segment
+                        best_q, best_score = None, 0.0
+                        for q in q_segment:
+                            if q.question_type != 'multi': continue
+                            score = self.calculate_similarity(self.clean_column_name(base_question), q.text)
+                            if score > best_score:
+                                best_score, best_q = score, q
+                        
+                        if best_q and best_score > 0.70:
+                            for group_col in group_cols:
+                                mapping[group_col] = best_q.number
+                                confidence_scores[group_col] = best_score
+                        
+                        # Advance the cursor past all columns in this group
+                        col_cursor += len(group_cols)
+                        continue
+                
+                # If not a group, process as a single column
+                col_cursor += 1
+        
+        # --- Sub-Pass 2b: Single Column Matching within segments ---
+        q_cursor = 0
+        for i, col in enumerate(columns):
+            if mapping[col] != 'UNMATCHED': continue # Skip already-matched multi-selects
+
+            clean_col = self.clean_column_name(col)
+            best_q, best_score, best_q_idx = None, 0.0, -1
             
-            # Only accept a match if it meets the strict confidence threshold
-            if best_match_q and highest_score > 0.70:
-                mapping[col] = best_match_q.number
-                confidence_scores[col] = highest_score
-                # **Self-Correction**: Re-sync our position to the found match
-                question_index = best_q_idx + 1
-            else:
-                # If no confident match is found, mark as unmatched and DO NOT advance the index.
-                # This allows the next column to try matching from the same starting point.
-                mapping[col] = 'UNMATCHED'
-                confidence_scores[col] = 0.0
-                
+            # Define a smart search window based on our current question cursor
+            search_window = sorted_questions[q_cursor : min(q_cursor + 20, len(sorted_questions))]
+            
+            for j, q in enumerate(search_window):
+                score = self.calculate_similarity(clean_col, q.text)
+                proximity_bonus = max(0, 1 - (j / 20)) * 0.2
+                score += proximity_bonus
+                if score > best_score:
+                    best_score, best_q, best_q_idx = score, q, q_cursor + j
+            
+            if best_q and best_score > 0.70:
+                mapping[col] = best_q.number
+                confidence_scores[col] = best_score
+                q_cursor = best_q_idx + 1 # Self-correct by advancing the cursor
+        
         return mapping, confidence_scores
 
+
     def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str, include_unmatched: bool = True) -> pd.DataFrame:
-        """Apply numbering with option to exclude unmatched columns"""
         df_numbered = df.copy()
         
         if not include_unmatched:
@@ -232,8 +250,9 @@ class QuestionNumberAligner:
         
         new_columns = {}
         for col in df_numbered.columns:
-            if col in mapping and mapping[col] != 'UNMATCHED' and mapping[col].isdigit():
-                new_columns[col] = f"{prefix_format.format(num=mapping[col])}{col}"
+            q_num = mapping.get(col)
+            if q_num and q_num != 'UNMATCHED' and q_num.isdigit():
+                new_columns[col] = f"{prefix_format.format(num=q_num)}{col}"
             else:
                 new_columns[col] = col
                 
@@ -383,7 +402,6 @@ Option 2 - Simple list:
         st.subheader("📋 Alignment Results")
         
         question_lookup = {q.number: q.text for q in st.session_state.questions}
-        question_options = ['UNMATCHED'] + [f"Q{num}. {text}" for num, text in sorted(question_lookup.items(), key=lambda x: int(x[0]))]
         
         total_cols = len(st.session_state.df.columns)
         matched_cols = sum(1 for v in st.session_state.mapping.values() if v != 'UNMATCHED')
@@ -393,27 +411,21 @@ Option 2 - Simple list:
         with col3: st.metric("Unmatched", total_cols - matched_cols)
         
         st.markdown("##### Review and Edit Mappings")
-        st.info("💡 Tip: Make all your changes, then click 'Confirm Changes' to update the mapping.")
-        
-        if 'temp_mapping' not in st.session_state:
-            st.session_state.temp_mapping = st.session_state.mapping.copy()
+        st.info("💡 Tip: Review the AI's matches. You can manually enter a question number in the 'Assigned #' column for any row.")
         
         review_data = []
         for i, col in enumerate(st.session_state.df.columns):
-            q_num = st.session_state.temp_mapping.get(col, 'UNMATCHED')
+            q_num = st.session_state.mapping.get(col, 'UNMATCHED')
             confidence = st.session_state.confidence_scores.get(col, 0.0)
             
-            if q_num != 'UNMATCHED':
-                current_selection = f"Q{q_num}. {question_lookup.get(q_num, 'Text not found')}"
-            else:
-                current_selection = 'UNMATCHED'
+            matched_text = f"Q{q_num}. {question_lookup.get(q_num, 'Text not found')}" if q_num != 'UNMATCHED' else 'N/A - Unmatched'
             
             review_data.append({
-                'Column #': i + 1,
+                'Col': index_to_excel_col(i),
                 'Column Name': col,
-                'Current Match': current_selection,
+                'Matched Question Text': matched_text,
                 'Confidence': confidence,
-                'Select Question': current_selection
+                'Assigned #': q_num
             })
         
         review_df = pd.DataFrame(review_data)
@@ -421,15 +433,13 @@ Option 2 - Simple list:
         edited_df = st.data_editor(
             review_df,
             column_config={
-                "Column #": st.column_config.NumberColumn("Col #", disabled=True),
+                "Col": st.column_config.TextColumn("Col", width="small", disabled=True),
                 "Column Name": st.column_config.TextColumn("Column Name", width="large", disabled=True),
-                "Current Match": st.column_config.TextColumn("Current Match", width="large", disabled=True),
+                "Matched Question Text": st.column_config.TextColumn("Matched Question Text", width="large", disabled=True),
                 "Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1, format="%.0%"),
-                "Select Question": st.column_config.SelectboxColumn(
-                    "Select Question",
-                    help="Choose the correct question for this column",
-                    options=question_options,
-                    width="large"
+                "Assigned #": st.column_config.TextColumn(
+                    "Assigned #",
+                    help="Manually enter a question number here (e.g., '7', '12', '180')."
                 )
             },
             use_container_width=True,
@@ -438,24 +448,14 @@ Option 2 - Simple list:
             key="editor"
         )
         
-        col1, col2, col3 = st.columns([1, 1, 3])
+        col1, col2 = st.columns([1, 4])
         with col1:
             if st.button("✅ Confirm Changes", type="primary", use_container_width=True):
                 for idx, row in edited_df.iterrows():
-                    selection = row['Select Question']
-                    if selection == 'UNMATCHED':
-                        q_num = 'UNMATCHED'
-                    else:
-                        q_num = selection.split('.')[0].replace('Q', '')
-                    st.session_state.mapping[row['Column Name']] = q_num
-                    st.session_state.temp_mapping[row['Column Name']] = q_num
+                    # Update the main mapping with any manual changes from the editor
+                    st.session_state.mapping[row['Column Name']] = str(row['Assigned #'])
                 st.success("✅ Changes confirmed and mapping updated!")
                 
-        with col2:
-            if st.button("↩️ Reset to Original", use_container_width=True):
-                st.session_state.temp_mapping = st.session_state.mapping.copy()
-                st.rerun()
-        
         st.markdown("---")
         st.subheader("📥 Export Options")
         
