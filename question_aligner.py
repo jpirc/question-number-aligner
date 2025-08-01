@@ -32,7 +32,6 @@ class QuestionNumberAligner:
     """Handles the logic for parsing and matching questions using the Gemini AI."""
 
     def __init__(self):
-        # Keywords to help classify questions after they've been extracted by the AI.
         self.question_patterns = {
             'multi_response': ['select all that apply', 'check all that apply', 'please select all', 'choose as many'],
             'matrix': ['how much do you agree', 'please rate', 'on a scale', 'how appealing', 'rate the following'],
@@ -40,15 +39,12 @@ class QuestionNumberAligner:
         }
 
     def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
-        """
-        Sends a PDF file to the Gemini API to extract questions and returns them as a list of Question objects.
-        """
+        """Sends a PDF file to the Gemini API to extract questions."""
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         if not api_key:
-            st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
+            st.error("GEMINI_API_KEY is not set in your Streamlit secrets.")
             return []
 
-        # Using the more powerful 'pro' model for the complex extraction task.
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
@@ -100,6 +96,31 @@ class QuestionNumberAligner:
             st.error(f"An error occurred during AI Question Extraction: {e}")
             return []
 
+    def _determine_question_type(self, text: str) -> str:
+        text_lower = text.lower()
+        for q_type, patterns in self.question_patterns.items():
+            if any(p in text_lower for p in patterns):
+                return q_type.replace('_response', '')
+        return 'single'
+
+    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str, include_unmatched: bool = True) -> pd.DataFrame:
+        df_numbered = df.copy()
+        
+        if not include_unmatched:
+            matched_cols = [col for col in df.columns if mapping.get(col, 'UNMATCHED') != 'UNMATCHED']
+            df_numbered = df_numbered[matched_cols]
+        
+        new_columns = {}
+        for col in df_numbered.columns:
+            q_num = mapping.get(col)
+            if q_num and q_num != 'UNMATCHED' and str(q_num).isdigit():
+                new_columns[col] = f"{prefix_format.format(num=q_num)}{col}"
+            else:
+                new_columns[col] = col
+                
+        df_numbered.rename(columns=new_columns, inplace=True)
+        return df_numbered
+    
     def match_with_gemini(self, df: pd.DataFrame, questions: List[Question]) -> Dict[str, str]:
         """
         Uses the Gemini API to perform the matching between dataset columns and extracted questions.
@@ -114,7 +135,6 @@ class QuestionNumberAligner:
         question_dict = {q.number: q.text for q in questions}
         column_list = list(df.columns)
 
-        # --- NEW, MORE GENERALIZED AND ROBUST PROMPT ---
         prompt = f"""
         You are an expert survey data analyst. Your task is to align dataset column headers with a list of official survey questions.
         You will be provided with two JSON objects:
@@ -164,31 +184,6 @@ class QuestionNumberAligner:
         except Exception as e:
             st.error(f"An error occurred during AI Matching: {e}")
             return {col: "ERROR" for col in column_list}
-
-    def _determine_question_type(self, text: str) -> str:
-        text_lower = text.lower()
-        for q_type, patterns in self.question_patterns.items():
-            if any(p in text_lower for p in patterns):
-                return q_type.replace('_response', '')
-        return 'single'
-
-    def apply_numbering_to_dataset(self, df: pd.DataFrame, mapping: Dict[str, str], prefix_format: str, include_unmatched: bool = True) -> pd.DataFrame:
-        df_numbered = df.copy()
-        
-        if not include_unmatched:
-            matched_cols = [col for col in df.columns if mapping.get(col, 'UNMATCHED') != 'UNMATCHED']
-            df_numbered = df_numbered[matched_cols]
-        
-        new_columns = {}
-        for col in df_numbered.columns:
-            q_num = mapping.get(col)
-            if q_num and q_num != 'UNMATCHED' and str(q_num).isdigit():
-                new_columns[col] = f"{prefix_format.format(num=q_num)}{col}"
-            else:
-                new_columns[col] = col
-                
-        df_numbered.rename(columns=new_columns, inplace=True)
-        return df_numbered
 
 # --- Streamlit UI ---
 def create_streamlit_app():
