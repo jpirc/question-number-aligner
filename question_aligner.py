@@ -48,11 +48,12 @@ class QuestionNumberAligner:
             st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
             return []
 
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        # --- MODEL UPGRADE ---
+        # Using the more powerful 'pro' model for the complex extraction task.
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
-        # --- NEW, MORE ROBUST PROMPT ---
         prompt = """
         You are a highly specialized text extraction tool. Your ONLY function is to scan the provided PDF and find every instance of a line that begins with a number followed by a period.
 
@@ -81,7 +82,7 @@ class QuestionNumberAligner:
         }
 
         try:
-            with st.spinner("Calling Gemini API to extract questions..."):
+            with st.spinner("Calling Gemini 1.5 Pro to extract questions... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'})
                 response.raise_for_status()
             response_json = response.json()
@@ -109,10 +110,8 @@ class QuestionNumberAligner:
             st.error("GEMINI_API_KEY is not set. Cannot perform AI matching.")
             return {}
 
-        # Switched to the more powerful 'pro' model to handle large inputs/outputs without truncation.
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
-        # Prepare the data for the prompt
         question_dict = {q.number: q.text for q in questions}
         column_list = list(df.columns)
 
