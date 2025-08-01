@@ -87,7 +87,13 @@ class QuestionNumberAligner:
         
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}, {"inlineData": {"mimeType": "application/pdf", "data": encoded_pdf}}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
+            "generationConfig": {"responseMimeType": "application/json"},
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
         }
 
         try:
@@ -96,6 +102,11 @@ class QuestionNumberAligner:
                 response.raise_for_status()
             response_json = response.json()
             
+            if not response_json.get('candidates'):
+                st.error("AI Question Extraction Failed: The API returned no candidates. This might be due to a content policy violation or an API error.")
+                st.json(response_json)
+                return []
+
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
             extracted_json_text = content_part.get('text', '{}')
@@ -118,30 +129,18 @@ class QuestionNumberAligner:
             st.error(f"An unexpected error occurred during AI Question Extraction: {e}")
             return []
 
-    def match_with_gemini(self, questions: List[Question], column_headers: List[str]) -> List[Dict[str, Any]]:
+    def match_with_gemini(self, questions: List[Question], column_headers: List[str]) -> Dict[str, Dict[str, str]]:
         """
         Uses Gemini 1.5 Pro with a compressed, specialized prompt to match columns to questions.
+        Returns a dictionary mapping column index to its match info.
         """
         api_key = self._get_api_key()
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
-        # --- PROMPT COMPRESSION LOGIC ---
         column_groups = self._analyze_column_patterns(column_headers)
-        
-        # Create a set of all indices that are part of a group
-        grouped_indices = set()
-        for indices in column_groups.values():
-            grouped_indices.update(indices)
-            
-        # Create a compact list of individual (ungrouped) columns
-        individual_columns = {
-            i: header for i, header in enumerate(column_headers) if i not in grouped_indices
-        }
-
-        # Create a compact, numbered list of questions
+        grouped_indices = set(idx for indices in column_groups.values() for idx in indices)
+        individual_columns = {i: header for i, header in enumerate(column_headers) if i not in grouped_indices}
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions])
-        
-        # Use compact JSON formatting for the API call
         formatted_groups = json.dumps(column_groups, separators=(',', ':'))
         formatted_individual_columns = json.dumps(individual_columns, separators=(',', ':'))
 
@@ -149,67 +148,77 @@ class QuestionNumberAligner:
         You are an expert market research data analyst. Your task is to map dataset columns to survey questions.
 
         **CRITICAL INSTRUCTIONS:**
-        1.  **Accuracy is Mandatory:** If you are not highly confident, assign "UNMATCHED". Do not guess.
-        2.  **Handle Groups:** For the "Pre-Analyzed Column Groups", assign the SAME question number to ALL columns in that group.
-        3.  **Handle Individuals:** Match the "Individual Columns" to the most appropriate question from the "Survey Questions" list.
-        4.  **No Forced Matches:** Assign "UNMATCHED" to system variables or metadata (e.g., 'record_id', 'start_time').
-        5.  **Output Format:** Your response MUST be a single JSON object with one key, "column_mapping". This key holds an array of objects, one for each original column, maintaining the original order from index 0 to {len(column_headers) - 1}. Each object needs: "column_index" (int), "original_header" (str), "assigned_question" (str), and "reasoning" (str).
+        1.  **Accuracy is Mandatory:** If not highly confident, assign "UNMATCHED".
+        2.  **Handle Groups:** For "Pre-Analyzed Column Groups", assign the SAME question number to ALL columns in that group.
+        3.  **Handle Individuals:** Match "Individual Columns" to the most appropriate question from the "Survey Questions" list.
+        4.  **No Forced Matches:** Assign "UNMATCHED" to system variables.
+        5.  **Output Format:** Your response MUST be a single JSON object with one key, "mapping". The value is another object where each key is a `column_index` (as a string) and the value is an object with two keys: "assigned_question" (string) and "reasoning" (string).
+
+        Example Response Snippet:
+        {{
+          "mapping": {{
+            "0": {{"assigned_question": "UNMATCHED", "reasoning": "System variable."}},
+            "1": {{"assigned_question": "1.", "reasoning": "Matches question about gender identity."}}
+          }}
+        }}
 
         ---
         **INPUT DATA**
-
-        **1. Survey Questions (Number: Text):**
+        1. Survey Questions (Number: Text):
         {compact_questions}
-
-        **2. Pre-Analyzed Column Groups (Prefix: [Column Indices]):**
+        2. Pre-Analyzed Column Groups (Prefix: [Column Indices]):
         {formatted_groups}
-
-        **3. Individual Columns (Index: Header):**
+        3. Individual Columns (Index: Header):
         {formatted_individual_columns}
-
         ---
         **YOUR TASK**
-        Analyze all inputs and generate the complete JSON output mapping ALL original column headers.
+        Analyze all inputs and generate the JSON output mapping ALL original column indices to their corresponding question number.
         """
 
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
+            "generationConfig": {"responseMimeType": "application/json"},
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
         }
         
-        extracted_json_text = ""
         try:
-            with st.spinner("AI is matching questions to columns (with compressed prompt)... This may take a moment."):
+            with st.spinner("AI is matching questions to columns (with robust reconstruction)... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
                 response.raise_for_status()
             response_json = response.json()
+
+            if not response_json.get('candidates'):
+                st.error("AI Matching Failed: The API returned no candidates. This is likely due to the prompt being blocked by safety filters.")
+                st.json(response_json)
+                return {}
 
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
             extracted_json_text = content_part.get('text', '{}').strip()
             
             if not extracted_json_text.startswith('{') or not extracted_json_text.endswith('}'):
-                st.error("Error: AI response for column matching was truncated or not valid JSON. This can happen with very large surveys.")
+                st.error("Error: AI response for column matching was truncated or not valid JSON.")
                 st.text_area("Invalid AI Response Snippet", value=extracted_json_text[:1000], height=150)
-                return []
+                return {}
 
             match_results = json.loads(extracted_json_text)
-            return match_results.get('column_mapping', [])
+            return match_results.get('mapping', {})
 
         except requests.exceptions.RequestException as e:
             st.error(f"A network error occurred during AI matching: {e}")
-            return []
+            return {}
         except json.JSONDecodeError as e:
             st.error(f"Error parsing AI response for column matching. The response was not valid JSON. Error: {e}")
             st.text_area("Raw AI Response", value=extracted_json_text, height=200)
-            return []
-        except (KeyError, IndexError) as e:
-            st.error(f"Error processing AI response structure. It might be missing expected keys. Error: {e}")
-            st.text_area("Raw AI Response", value=response.text if 'response' in locals() else "No response object.", height=200)
-            return []
+            return {}
         except Exception as e:
             st.error(f"An unexpected error occurred during AI Matching: {e}")
-            return []
+            return {}
 
     def apply_numbering_to_dataset(self, df: pd.DataFrame, final_mapping_df: pd.DataFrame, prefix_format: str, include_unmatched: bool) -> pd.DataFrame:
         """Applies the final numbering to the dataset based on the review table."""
@@ -287,10 +296,25 @@ def create_streamlit_app():
                 st.success(f"✅ AI successfully extracted {len(questions)} questions.")
                 
                 column_headers = st.session_state.original_df.columns.tolist()
-                match_results = aligner.match_with_gemini(questions, column_headers)
+                match_results_dict = aligner.match_with_gemini(questions, column_headers)
 
-                if match_results:
-                    review_df = pd.DataFrame(match_results)
+                if match_results_dict:
+                    # --- PYTHON-SIDE RECONSTRUCTION ---
+                    reconstructed_list = []
+                    for i, header in enumerate(column_headers):
+                        mapping_info = match_results_dict.get(str(i), {
+                            "assigned_question": "UNMATCHED",
+                            "reasoning": "AI did not provide a mapping for this index."
+                        })
+                        
+                        reconstructed_list.append({
+                            "column_index": i,
+                            "original_header": header,
+                            "assigned_question": mapping_info.get("assigned_question", "UNMATCHED"),
+                            "reasoning": mapping_info.get("reasoning", "N/A")
+                        })
+                    
+                    review_df = pd.DataFrame(reconstructed_list)
                     review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
                     review_df.rename(columns={
                         'original_header': 'Column Name',
@@ -300,7 +324,7 @@ def create_streamlit_app():
                     st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
                     st.success("✅ AI matching complete!")
                 else:
-                    st.error("AI matching failed to produce results. Please check the errors above. You may need to try again or use a smaller/simpler survey.")
+                    st.error("AI matching failed to produce results. Please check the errors above.")
                     st.session_state.review_df = None
             else:
                 st.error("AI question extraction failed. Cannot proceed with matching.")
