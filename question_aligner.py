@@ -53,7 +53,7 @@ class QuestionNumberAligner:
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
         # --- IMPROVED PROMPT ---
-        # This prompt is more specific about handling complex layouts like matrix questions.
+        # This prompt is more specific about handling complex layouts like matrix and ranking questions.
         prompt = """
         You are an expert data cleaning assistant specializing in survey reports.
         Your task is to analyze the provided PDF document and extract EVERY numbered question.
@@ -61,15 +61,15 @@ class QuestionNumberAligner:
         Follow these rules with extreme precision:
         1.  Your primary goal is to find every single piece of text that starts with a number and a period (e.g., "1.", "30.", "175.").
         2.  Extract the full, complete question text that follows this number. This includes any prefixes like "HOH BDAY -".
-        3.  **Crucially, for matrix questions** (e.g., "How much do you agree or disagree with the following statements?"), the introductory sentence IS the question. You must extract this sentence and then STOP. Do not include the list of statements or the rating scale that follows.
+        3.  **Crucially, for matrix or ranking questions** (e.g., "How much do you agree..." or "Please rank the following..."), the introductory sentence IS the question. You must extract this sentence and then STOP. Do not include the list of statements, options, or the rating scale that follows.
         4.  Ignore all other text that is not part of a numbered question, such as page headers, footers, charts, data tables, and individual answer choices for single-select questions.
         5.  The final output must be a single, valid JSON object. The keys must be the question numbers (as strings), and the values must be the clean, full question text.
 
-        Example of a perfect response, including a matrix question:
+        Example of a perfect response for different question types:
         {
           "29": "HOH BDAY - Which of the following emotions did you feel when watching this ad? Please select all that apply.",
           "30": "HOH BDAY - How much do you agree or disagree with the following statements?",
-          "31": "HOH BDAY - How likely are you to consider purchasing your kitchen cabinets from Cabinets To Go after watching this ad?"
+          "39": "HOH BDAY - Please rank the following factors from most to least appealing to when considering a kitchen renovation."
         }
 
         Do not miss any questions. Scan every page thoroughly. There should be many questions, often over 100.
