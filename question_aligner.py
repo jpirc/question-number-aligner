@@ -32,7 +32,6 @@ class QuestionNumberAligner:
     """Handles the logic for parsing and matching questions using the Gemini AI."""
 
     def __init__(self):
-        # Keywords to help classify questions after they've been extracted by the AI.
         self.question_patterns = {
             'multi_response': ['select all that apply', 'check all that apply', 'please select all', 'choose as many'],
             'matrix': ['how much do you agree', 'please rate', 'on a scale', 'how appealing', 'rate the following'],
@@ -40,15 +39,12 @@ class QuestionNumberAligner:
         }
 
     def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
-        """
-        Sends a PDF file to the Gemini API to extract questions and returns them as a list of Question objects.
-        """
+        """Sends a PDF file to the Gemini API to extract questions."""
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         if not api_key:
-            st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
+            st.error("GEMINI_API_KEY is not set in your Streamlit secrets.")
             return []
 
-        # Using the more powerful 'pro' model for the complex extraction task.
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
@@ -100,6 +96,19 @@ class QuestionNumberAligner:
             st.error(f"An error occurred during AI Question Extraction: {e}")
             return []
 
+    # --- HELPER METHODS RESTORED TO FIX ATTRIBUTE ERROR ---
+    def clean_column_name(self, col_name: str) -> str:
+        """Cleans and standardizes a column name for better matching."""
+        if not isinstance(col_name, str):
+            return ""
+        cleaned = re.sub(r'[^\w\s-]', ' ', col_name)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned.lower()
+
+    def calculate_similarity(self, str1: str, str2: str) -> float:
+        """Calculates a similarity ratio between two strings."""
+        return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
+
     def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Tuple[Dict[str, str], Dict[str, float]]:
         """
         A more robust, two-pass matching algorithm using "anchoring" and "interpolation".
@@ -111,38 +120,33 @@ class QuestionNumberAligner:
         sorted_questions = sorted(questions, key=lambda q: int(q.number))
         
         # --- Pass 1: High-Confidence Anchoring ---
-        # Find near-perfect matches to act as reliable guideposts.
         anchors = []
         used_q_indices = set()
         for i, col in enumerate(columns):
             clean_col = self.clean_column_name(col)
-            # Only consider single-select questions for anchoring to avoid ambiguity
             if ' - ' in col: continue 
             
             for j, q in enumerate(sorted_questions):
                 if j in used_q_indices: continue
                 score = self.calculate_similarity(clean_col, q.text)
-                if score > 0.95: # Very high confidence for an anchor
-                    anchors.append({'col_idx': i, 'q_idx': j, 'q_num': q.number, 'score': score})
+                if score > 0.95:
+                    anchors.append({'col_idx': i, 'q_idx': j})
                     used_q_indices.add(j)
                     break 
 
         # --- Pass 2: Interpolation between Anchors ---
-        # Add start and end points to process the whole list
         proc_anchors = [{'col_idx': -1, 'q_idx': -1}] + anchors + [{'col_idx': len(columns), 'q_idx': len(sorted_questions)}]
 
         for i in range(len(proc_anchors) - 1):
             start_anchor = proc_anchors[i]
             end_anchor = proc_anchors[i+1]
 
-            # Define the segment of columns and questions to work on
             col_segment_indices = range(start_anchor['col_idx'] + 1, end_anchor['col_idx'])
             q_segment = sorted_questions[start_anchor['q_idx'] + 1 : end_anchor['q_idx']]
 
             if not col_segment_indices or not q_segment:
                 continue
 
-            # --- Sub-Pass 2a: Multi-Select Grouping within the segment ---
             processed_in_segment = set()
             for col_idx in col_segment_indices:
                 if col_idx in processed_in_segment: continue
@@ -167,7 +171,6 @@ class QuestionNumberAligner:
                                 confidence_scores[columns[group_col_idx]] = best_score
                                 processed_in_segment.add(group_col_idx)
 
-        # --- Sub-Pass 2b: Single Column Matching (Self-Correcting) ---
         q_cursor = 0
         for i, col in enumerate(columns):
             if mapping[col] != 'UNMATCHED': continue
@@ -296,7 +299,6 @@ def create_streamlit_app():
         st.markdown("##### Review and Edit Mappings")
         st.info("💡 Tip: Review the AI's matches. You can manually enter a question number in the 'Assigned #' column for any row.")
         
-        # Create the DataFrame for editing from the main mapping
         review_data = []
         for i, col in enumerate(st.session_state.df.columns):
             q_num = st.session_state.mapping.get(col, 'UNMATCHED')
