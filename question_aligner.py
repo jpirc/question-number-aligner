@@ -44,7 +44,6 @@ class QuestionNumberAligner:
         """
         Sends a PDF file to the Gemini API to extract questions and returns them as a list of Question objects.
         """
-        # Securely get the API key from Streamlit's secrets manager.
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         if not api_key:
             st.error("GEMINI_API_KEY is not set in your Streamlit secrets. Please add it to run the AI extraction.")
@@ -155,63 +154,69 @@ class QuestionNumberAligner:
         return groups
 
     def match_columns_to_questions(self, df: pd.DataFrame, questions: List[Question]) -> Tuple[Dict[str, str], Dict[str, float]]:
-        """Returns both mapping and confidence scores with improved sequential logic."""
+        """
+        Returns mapping and confidence scores with a more robust, self-correcting sequential algorithm.
+        """
         columns = list(df.columns)
         mapping = {}
         confidence_scores = {}
         
         sorted_questions = sorted(questions, key=lambda q: int(q.number))
         
+        # --- Pass 1: Handle Multi-Select Groups ---
         multi_groups = self.find_multi_response_groups(columns)
-        
         for base_question, group_cols in multi_groups.items():
             clean_base = self.clean_column_name(base_question)
             best_match_q, highest_score = None, 0.0
             
             for q in questions:
+                # Only match multi-select groups to questions identified as multi-response
+                if q.question_type != 'multi': continue
+                
                 score = self.calculate_similarity(clean_base, q.text)
-                if q.question_type == 'multi': 
-                    score += 0.2
                 if score > highest_score:
                     highest_score, best_match_q = score, q
                     
-            if best_match_q and highest_score > 0.7: # **Stricter 70% threshold**
+            if best_match_q and highest_score > 0.70: # Stricter 70% threshold
                 for col in group_cols:
                     mapping[col] = best_match_q.number
                     confidence_scores[col] = highest_score
 
+        # --- Pass 2: Handle Single Columns with Self-Correcting Logic ---
         unmapped_columns = [col for col in columns if col not in mapping]
-        question_index = 0
+        question_index = 0 # Our current position in the sorted_questions list
         
-        for col_idx, col in enumerate(unmapped_columns):
+        for col in unmapped_columns:
             clean_col = self.clean_column_name(col)
             best_match_q, highest_score = None, 0.0
             best_q_idx = -1
             
-            # **Enhanced Sequential Logic**: Search forward from the last known good match
-            # This creates a "search window" that moves along with the columns.
-            search_window = sorted_questions[question_index:]
+            # Define a "look-ahead" window to prevent illogical jumps
+            look_ahead_window = 20
+            search_end_index = min(question_index + look_ahead_window, len(sorted_questions))
+            search_window = sorted_questions[question_index:search_end_index]
             
-            for q_idx, q in enumerate(search_window):
-                actual_q_idx = question_index + q_idx
+            for q_idx_in_window, q in enumerate(search_window):
+                actual_q_idx = question_index + q_idx_in_window
                 score = self.calculate_similarity(clean_col, q.text)
                 
-                # Proximity bonus is now more impactful and focused on the immediate next questions
-                distance = q_idx # Distance from the start of our search window
-                proximity_bonus = max(0, 1 - (distance / 15)) * 0.3 # Strong bonus for the next ~15 questions
+                # Proximity bonus for questions that appear in the expected order
+                proximity_bonus = max(0, 1 - (q_idx_in_window / look_ahead_window)) * 0.2
                 score += proximity_bonus
                     
                 if score > highest_score:
                     highest_score, best_match_q = score, q
                     best_q_idx = actual_q_idx
             
-            # **Stricter 70% threshold for single columns**
-            if best_match_q and highest_score > 0.7:
+            # Only accept a match if it meets the strict confidence threshold
+            if best_match_q and highest_score > 0.70:
                 mapping[col] = best_match_q.number
                 confidence_scores[col] = highest_score
-                # **Crucially, advance the index to prevent jumping backwards**
+                # **Self-Correction**: Re-sync our position to the found match
                 question_index = best_q_idx + 1
             else:
+                # If no confident match is found, mark as unmatched and DO NOT advance the index.
+                # This allows the next column to try matching from the same starting point.
                 mapping[col] = 'UNMATCHED'
                 confidence_scores[col] = 0.0
                 
