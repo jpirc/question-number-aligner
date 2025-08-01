@@ -142,6 +142,9 @@ class QuestionNumberAligner:
         mapping = {}
         confidence_scores = {}
         
+        # Sort questions by number for order-based matching
+        sorted_questions = sorted(questions, key=lambda q: int(q.number))
+        
         # Don't track used questions - allow reuse for repeated questions (ad variants)
         multi_groups = self.find_multi_response_groups(columns)
         
@@ -162,28 +165,51 @@ class QuestionNumberAligner:
                     mapping[col] = best_match_q.number
                     confidence_scores[col] = highest_score
 
-        # Process remaining columns
-        for col in columns:
-            if col in mapping: 
-                continue
-                
+        # Process remaining columns with order consideration
+        unmapped_columns = [col for col in columns if col not in mapping]
+        question_index = 0
+        
+        for col_idx, col in enumerate(unmapped_columns):
             clean_col = self.clean_column_name(col)
             best_match_q, highest_score = None, 0.0
+            best_q_idx = -1
             
-            for q in questions:
+            # Start searching from where we left off in the question list
+            for q_idx, q in enumerate(sorted_questions[question_index:], start=question_index):
                 score = self.calculate_similarity(clean_col, q.text)
                 
                 # Boost score for demographic matches
                 if any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns) and \
                    any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
                     score += 0.3
+                
+                # Add proximity bonus - questions closer to expected position get a boost
+                # This helps when column text is generic (like in monadic surveys)
+                proximity_bonus = max(0, 1 - abs(q_idx - question_index) / len(sorted_questions)) * 0.2
+                score += proximity_bonus
                     
                 if score > highest_score:
                     highest_score, best_match_q = score, q
+                    best_q_idx = q_idx
+            
+            # Also check earlier questions in case of repeats
+            for q_idx, q in enumerate(sorted_questions[:question_index]):
+                score = self.calculate_similarity(clean_col, q.text)
+                
+                if any(p in clean_col for patterns in self.demographic_patterns.values() for p in patterns) and \
+                   any(p in q.text.lower() for patterns in self.demographic_patterns.values() for p in patterns):
+                    score += 0.3
+                    
+                if score > highest_score:
+                    highest_score, best_match_q = score, q
+                    best_q_idx = q_idx
                     
             if best_match_q and highest_score > 0.4:
                 mapping[col] = best_match_q.number
                 confidence_scores[col] = highest_score
+                # Update our position in the question list for order-based matching
+                if best_q_idx >= question_index:
+                    question_index = best_q_idx
             else:
                 mapping[col] = 'UNMATCHED'
                 confidence_scores[col] = 0.0
@@ -306,12 +332,16 @@ def create_streamlit_app():
             st.metric("Unmatched", total_cols - matched_cols)
         
         st.markdown("##### Review and Edit Mappings")
-        st.info("💡 Tip: Click on any dropdown in the 'Select Question' column to change the matched question.")
+        st.info("💡 Tip: Make all your changes, then click 'Confirm Changes' to update the mapping.")
+        
+        # Initialize temporary mapping if not exists
+        if 'temp_mapping' not in st.session_state:
+            st.session_state.temp_mapping = st.session_state.mapping.copy()
         
         # Create review dataframe
         review_data = []
         for col in st.session_state.df.columns:
-            q_num = st.session_state.mapping.get(col, 'UNMATCHED')
+            q_num = st.session_state.temp_mapping.get(col, 'UNMATCHED')
             confidence = st.session_state.confidence_scores.get(col, 0.0)
             
             # Create current selection for dropdown
@@ -345,18 +375,31 @@ def create_streamlit_app():
             },
             use_container_width=True,
             hide_index=True,
-            height=400
+            height=400,
+            key="editor"
         )
         
-        # Update mapping based on edits
-        for idx, row in edited_df.iterrows():
-            selection = row['Select Question']
-            if selection == 'UNMATCHED':
-                st.session_state.mapping[row['Column Name']] = 'UNMATCHED'
-            else:
-                # Extract question number from selection (format: "Q123. Question text")
-                q_num = selection.split('.')[0].replace('Q', '')
-                st.session_state.mapping[row['Column Name']] = q_num
+        # Confirm changes button
+        col1, col2, col3 = st.columns([1, 1, 3])
+        with col1:
+            if st.button("✅ Confirm Changes", type="primary", use_container_width=True):
+                # Update mapping based on edits
+                for idx, row in edited_df.iterrows():
+                    selection = row['Select Question']
+                    if selection == 'UNMATCHED':
+                        st.session_state.mapping[row['Column Name']] = 'UNMATCHED'
+                        st.session_state.temp_mapping[row['Column Name']] = 'UNMATCHED'
+                    else:
+                        # Extract question number from selection (format: "Q123. Question text")
+                        q_num = selection.split('.')[0].replace('Q', '')
+                        st.session_state.mapping[row['Column Name']] = q_num
+                        st.session_state.temp_mapping[row['Column Name']] = q_num
+                st.success("✅ Changes confirmed and mapping updated!")
+                
+        with col2:
+            if st.button("↩️ Reset to Original", use_container_width=True):
+                st.session_state.temp_mapping = st.session_state.mapping.copy()
+                st.rerun()
         
         # Export section
         st.markdown("---")
