@@ -38,12 +38,83 @@ class QuestionNumberAligner:
             st.stop()
         return api_key
 
+    def calculate_optimal_batch_size(self, 
+                                   total_columns: int, 
+                                   total_questions: int,
+                                   column_complexity: float) -> int:
+        """
+        Dynamically calculate optimal batch size based on multiple factors.
+        
+        Args:
+            total_columns: Total number of columns to process
+            total_questions: Total number of questions in the survey
+            column_complexity: Average length/complexity of column names
+        
+        Returns:
+            Optimal batch size
+        """
+        # Base calculations
+        base_size = 100
+        
+        # Adjust based on total columns (fewer API calls for large datasets)
+        if total_columns > 1000:
+            size_multiplier = 2.0
+        elif total_columns > 500:
+            size_multiplier = 1.5
+        elif total_columns < 100:
+            size_multiplier = 0.5  # Smaller batches for small datasets
+        else:
+            size_multiplier = 1.0
+        
+        # Adjust based on question count (larger context needs smaller batches)
+        if total_questions > 200:
+            question_factor = 0.7
+        elif total_questions > 100:
+            question_factor = 0.85
+        else:
+            question_factor = 1.0
+        
+        # Adjust based on column name complexity
+        # Longer column names = more tokens = smaller batches
+        if column_complexity > 100:  # Very long column names
+            complexity_factor = 0.6
+        elif column_complexity > 50:
+            complexity_factor = 0.8
+        else:
+            complexity_factor = 1.0
+        
+        # Calculate final batch size
+        optimal_size = int(base_size * size_multiplier * question_factor * complexity_factor)
+        
+        # Enforce limits based on Gemini's token constraints
+        # Gemini 1.5 Pro has ~2M token context, but we want to stay well below
+        min_size = 25
+        max_size = 300  # Conservative max to ensure we don't hit token limits
+        
+        return max(min_size, min(optimal_size, max_size))
+    
+    def estimate_column_complexity(self, column_headers: List[str]) -> float:
+        """Calculate average complexity of column names"""
+        if not column_headers:
+            return 0
+        
+        total_length = sum(len(col) for col in column_headers)
+        avg_length = total_length / len(column_headers)
+        
+        # Check for complex patterns
+        complex_patterns = sum(1 for col in column_headers if ' - ' in col or ':' in col)
+        complexity_ratio = complex_patterns / len(column_headers)
+        
+        # Combined complexity score
+        return avg_length * (1 + complexity_ratio)
+
     def extract_questions_with_gemini(self, pdf_file_bytes: bytes) -> List[Question]:
         """
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
         """
         api_key = self._get_api_key()
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # Updated API endpoint - removed 'beta'
+        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -79,7 +150,16 @@ class QuestionNumberAligner:
         try:
             with st.spinner("Calling Gemini 1.5 Pro to extract questions... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+                
+                # More detailed error handling for 404
+                if response.status_code == 404:
+                    st.error("API endpoint not found. Trying alternative endpoint...")
+                    # Try v1beta endpoint as fallback
+                    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+                    response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+                
                 response.raise_for_status()
+                
             response_json = response.json()
             
             if not response_json.get('candidates'):
@@ -100,6 +180,9 @@ class QuestionNumberAligner:
 
         except requests.exceptions.RequestException as e:
             st.error(f"A network error occurred: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                st.error(f"Response status code: {e.response.status_code}")
+                st.error(f"Response text: {e.response.text[:500]}...")  # First 500 chars
             return []
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             st.error(f"Error parsing AI response for question extraction. The response may be malformed. Error: {e}")
@@ -115,7 +198,8 @@ class QuestionNumberAligner:
         Returns a simple pipe-delimited string.
         """
         api_key = self._get_api_key()
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # Updated API endpoint - removed 'beta'
+        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
@@ -160,6 +244,12 @@ class QuestionNumberAligner:
         
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+            
+            # Try fallback endpoint if main one fails
+            if response.status_code == 404:
+                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+            
             response.raise_for_status()
             response_json = response.json()
 
@@ -178,10 +268,21 @@ class QuestionNumberAligner:
             st.error(f"An unexpected error occurred during a batch match: {e}")
             return ""
 
-    def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = 150) -> Dict[str, Dict[str, str]]:
+    def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = None) -> Dict[str, Dict[str, str]]:
         """
         Orchestrates the stateful, sequential matching process with a focused question window.
+        Now with dynamic batch sizing support.
         """
+        # Calculate optimal batch size if not provided
+        if batch_size is None:
+            complexity = self.estimate_column_complexity(column_headers)
+            batch_size = self.calculate_optimal_batch_size(
+                len(column_headers), 
+                len(questions), 
+                complexity
+            )
+            st.info(f"🎯 Using dynamic batch size: {batch_size} columns per API call")
+        
         full_mapping = {}
         last_matched_q_num = 0
         
@@ -206,7 +307,7 @@ class QuestionNumberAligner:
             
             column_batch_dict = {start_index + j: header for j, header in enumerate(batch_headers)}
 
-            # --- NEW: Focused Question Window Logic ---
+            # --- Focused Question Window Logic ---
             # Find the index in our sorted list where we should start looking for questions
             window_start_index = 0
             for idx, q_num in enumerate(question_indices):
@@ -224,7 +325,7 @@ class QuestionNumberAligner:
             # Get the actual Question objects for the window
             questions_window = [question_lookup[q_num] for q_num in questions_in_window_indices]
 
-            progress_text = f"Processing batch {i+1}/{num_batches} (Context: Start from Q{last_matched_q_num+1})"
+            progress_text = f"Processing batch {i+1}/{num_batches} (Context: Start from Q{last_matched_q_num+1}, Batch size: {batch_size})"
             progress_bar.progress((i) / num_batches, text=progress_text)
             
             response_string = self._match_batch_with_gemini(questions_window, column_batch_dict, last_matched_q_num)
@@ -303,6 +404,29 @@ def create_streamlit_app():
     
     aligner = QuestionNumberAligner()
 
+    # Sidebar for advanced settings
+    with st.sidebar:
+        st.subheader("⚙️ Advanced Settings")
+        
+        # Batch size options
+        batch_option = st.radio(
+            "Batch Size Strategy:",
+            ["Automatic (Recommended)", "Manual"],
+            help="Automatic mode optimizes based on your data"
+        )
+        
+        if batch_option == "Manual":
+            manual_batch_size = st.slider(
+                "Columns per batch:",
+                min_value=25,
+                max_value=300,
+                value=100,
+                step=25,
+                help="Larger batches = fewer API calls but higher latency"
+            )
+        else:
+            manual_batch_size = None
+
     st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
     with col1:
@@ -338,7 +462,13 @@ def create_streamlit_app():
                 st.success(f"✅ AI successfully extracted {len(questions)} questions.")
                 
                 column_headers = st.session_state.original_df.columns.tolist()
-                match_results_dict = aligner.match_with_gemini_in_batches(questions, column_headers)
+                
+                # Use the selected batch size (automatic or manual)
+                match_results_dict = aligner.match_with_gemini_in_batches(
+                    questions, 
+                    column_headers,
+                    batch_size=manual_batch_size  # Will be None for automatic mode
+                )
 
                 if match_results_dict:
                     reconstructed_list = []
