@@ -42,20 +42,17 @@ class QuestionNumberAligner:
         """Test the API connection with various endpoints."""
         api_key = self._get_api_key()
         
-        # List of endpoints to try
+        # Updated endpoints based on the available models shown
         endpoints = [
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent",
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+            "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent",
+            "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
         ]
         
         test_payload = {
-            "contents": [{"role": "user", "parts": [{"text": "Hello, please respond with 'API is working'"}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 50
-            }
+            "contents": [{"parts": [{"text": "Hello, please respond with 'API is working'"}]}]
         }
         
         results = {}
@@ -165,9 +162,8 @@ class QuestionNumberAligner:
         """
         api_key = self._get_api_key()
         
-        # Try to get the working endpoint from session state
-        working_endpoint = st.session_state.get('working_endpoint', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent')
-        api_url = f"{working_endpoint}?key={api_key}"
+        # Use v1 endpoint with the correct format
+        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -178,81 +174,91 @@ class QuestionNumberAligner:
         2. Identify every piece of text that appears to be a numbered survey question.
         3. For each match, capture the question number and the complete question text that follows. The question text ends when you encounter a chart, a data table, or the start of the next numbered question.
         4. Clean the extracted text to form a single, coherent sentence. Remove any line breaks or formatting noise.
-        5. Assemble the results into a single, valid JSON object. The object should contain one key, "questions", which holds an array of objects. Each object in the array must have two keys: "question_number" (as a string) and "question_text" (the cleaned text).
-        Example of a perfect response:
+        5. Return the results as a valid JSON object with this structure:
         {
           "questions": [
-            { "question_number": "39", "question_text": "HOH BDAY - Please rank the following factors from most to least appealing to when considering a kitchen renovation." },
-            { "question_number": "40", "question_text": "HOH BDAY - Which one of the two taglines do you like the most for this campaign?" }
+            { "question_number": "1", "question_text": "Question text here" },
+            { "question_number": "2", "question_text": "Another question" }
           ]
         }
-        Find every single question. Do not skip any. The output must be only the JSON object.
+        Find every single question. Do not skip any.
         """
         
-        # Add instruction to output JSON in the prompt
-        json_prompt = prompt + "\n\nIMPORTANT: Return ONLY valid JSON, no additional text or formatting."
-        
         payload = {
-            "contents": [{"role": "user", "parts": [
-                {"text": json_prompt}, 
-                {"inlineData": {"mimeType": "application/pdf", "data": encoded_pdf}}
-            ]}],
+            "contents": [{
+                "parts": [
+                    {"text": prompt}, 
+                    {
+                        "inline_data": {
+                            "mime_type": "application/pdf",
+                            "data": encoded_pdf
+                        }
+                    }
+                ]
+            }],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 8192,
-                "responseMimeType": "application/json"
-            },
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ]
+                "maxOutputTokens": 8192
+            }
         }
 
         try:
             with st.spinner("Calling Gemini API to extract questions... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-                response.raise_for_status()
+                
+                if response.status_code != 200:
+                    st.error(f"API Error {response.status_code}: {response.text[:500]}")
+                    return []
                 
             response_json = response.json()
             
             if not response_json.get('candidates'):
-                st.error("AI Question Extraction Failed: The API returned no candidates. This might be due to a content policy violation or an API error.")
-                st.json(response_json)
+                st.error("AI Question Extraction Failed: The API returned no candidates.")
                 return []
 
-            candidate = response_json.get('candidates', [{}])[0]
-            content_part = candidate.get('content', {}).get('parts', [{}])[0]
-            extracted_json_text = content_part.get('text', '{}')
-            
-            # Clean up the response if needed
-            extracted_json_text = extracted_json_text.strip()
-            if extracted_json_text.startswith('```json'):
-                extracted_json_text = extracted_json_text[7:]
-            if extracted_json_text.endswith('```'):
-                extracted_json_text = extracted_json_text[:-3]
-            
-            question_data = json.loads(extracted_json_text)
-            
-            questions = [Question(number=str(q['question_number']), text=q['question_text']) 
-                         for q in question_data.get('questions', [])]
-            
-            return sorted(questions, key=lambda q: int(re.search(r'\d+', q.number).group() if re.search(r'\d+', q.number) else 0))
+            # Extract the text from the response
+            try:
+                candidate = response_json['candidates'][0]
+                content = candidate['content']
+                parts = content['parts']
+                extracted_text = parts[0]['text']
+                
+                # Try to find JSON in the response
+                # Look for JSON structure
+                json_start = extracted_text.find('{')
+                json_end = extracted_text.rfind('}') + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_str = extracted_text[json_start:json_end]
+                else:
+                    json_str = extracted_text
+                
+                # Clean up the response if needed
+                json_str = json_str.strip()
+                if json_str.startswith('```json'):
+                    json_str = json_str[7:]
+                if json_str.startswith('```'):
+                    json_str = json_str[3:]
+                if json_str.endswith('```'):
+                    json_str = json_str[:-3]
+                
+                question_data = json.loads(json_str)
+                
+                questions = [Question(number=str(q['question_number']), text=q['question_text']) 
+                             for q in question_data.get('questions', [])]
+                
+                return sorted(questions, key=lambda q: int(re.search(r'\d+', q.number).group() if re.search(r'\d+', q.number) else 0))
+                
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                st.error(f"Error parsing AI response: {e}")
+                st.text_area("Raw response:", extracted_text if 'extracted_text' in locals() else str(response_json), height=200)
+                return []
 
         except requests.exceptions.RequestException as e:
             st.error(f"A network error occurred: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                st.error(f"Response status code: {e.response.status_code}")
-                st.error(f"Response text: {e.response.text[:500]}...")
-            return []
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            st.error(f"Error parsing AI response for question extraction. The response may be malformed. Error: {e}")
-            if 'extracted_json_text' in locals():
-                st.text_area("Extracted JSON Text", value=extracted_json_text, height=200)
             return []
         except Exception as e:
-            st.error(f"An unexpected error occurred during AI Question Extraction: {e}")
+            st.error(f"An unexpected error occurred: {e}")
             return []
 
     def _match_batch_with_gemini(self, questions_window: List[Question], column_batch: Dict[int, str], last_q_num: int) -> str:
@@ -262,75 +268,61 @@ class QuestionNumberAligner:
         """
         api_key = self._get_api_key()
         
-        # Use the working endpoint from session state
-        working_endpoint = st.session_state.get('working_endpoint', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent')
-        api_url = f"{working_endpoint}?key={api_key}"
+        # Use v1 endpoint
+        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
 
         prompt = f"""
-        You are an expert market research data analyst. Your task is to map a batch of dataset columns to a list of survey questions, maintaining a strict numerical sequence.
+        You are an expert market research data analyst. Your task is to map dataset columns to survey questions.
 
-        **CRITICAL INSTRUCTIONS:**
-        1.  **SEQUENTIAL CONTEXT IS MANDATORY:** In the previous batch, the last assigned question number was **{last_q_num}**. You MUST continue the numbering from there. Do not jump backwards to earlier question numbers, even if the text seems to match. This is likely a monadic study with repeating question blocks.
-        2.  **Accuracy is Mandatory:** If not highly confident, assign "UNMATCHED".
-        3.  **Handle Multi-Part Questions:** If multiple columns belong to the same question (e.g., "Q65 - Option A", "Q65 - Option B"), assign the SAME question number to all of them.
-        4.  **Output Format:** Your response MUST be plain text. Each line MUST follow this exact format: `column_index|assigned_question|reasoning`. Use the pipe `|` character as a delimiter. Do not output JSON or any other format.
-        5.  **Assigned Question VALUE:** For the "assigned_question" part, you MUST return ONLY the question number (e.g., "63", "64a") or the literal string "UNMATCHED".
+        CRITICAL INSTRUCTIONS:
+        1. The last assigned question number was {last_q_num}. Continue from there - do not go backwards.
+        2. If not confident, assign "UNMATCHED".
+        3. If multiple columns belong to the same question, use the SAME question number.
+        4. Output format: column_index|assigned_question|reasoning
 
-        Example Response:
-        150|63|Follows sequence from last batch.
-        151|64|Matches question about social media usage.
-        152|64|Option for question 64.
-
-        ---
-        **INPUT DATA**
-        1. Available Survey Questions (Number: Text):
+        Available Questions:
         {compact_questions}
 
-        2. Batch of Dataset Column Headers to Map (Index: Header):
+        Column Headers to Map:
         {formatted_columns}
-        ---
-        **YOUR TASK**
-        Analyze the inputs and generate the pipe-delimited text output mapping ALL column indices in the provided batch, respecting the sequential context.
+
+        Provide your response as plain text with one mapping per line.
         """
 
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 4096,
-                "responseMimeType": "text/plain"
-            },
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ]
+                "maxOutputTokens": 4096
+            }
         }
         
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-            response.raise_for_status()
+            
+            if response.status_code != 200:
+                st.error(f"Batch API Error {response.status_code}: {response.text[:200]}")
+                return ""
+                
             response_json = response.json()
 
             if not response_json.get('candidates'):
-                st.error(f"AI Matching Failed for a batch: The API returned no candidates.")
+                st.error("AI Matching Failed for a batch: No candidates returned.")
                 return ""
 
-            candidate = response_json.get('candidates', [{}])[0]
-            content_part = candidate.get('content', {}).get('parts', [{}])[0]
-            return content_part.get('text', '').strip()
+            # Extract text from response
+            candidate = response_json['candidates'][0]
+            content = candidate['content']
+            parts = content['parts']
+            return parts[0]['text'].strip()
 
-        except requests.exceptions.RequestException as e:
-            st.error(f"A network error occurred during a batch match: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                st.error(f"Response text: {e.response.text[:500]}...")
-            return ""
         except Exception as e:
-            st.error(f"An unexpected error occurred during a batch match: {e}")
+            st.error(f"Error in batch match: {e}")
             return ""
 
     def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = None) -> Dict[str, Dict[str, str]]:
@@ -415,7 +407,8 @@ class QuestionNumberAligner:
                         if current_q_num > max_q_in_batch:
                             max_q_in_batch = current_q_num
                 else:
-                    st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
+                    if line.strip():  # Only warn if line is not empty
+                        st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
             
             # Only update if the AI found a new higher number
             if max_q_in_batch > last_matched_q_num:
@@ -459,14 +452,13 @@ def create_streamlit_app():
     st.set_page_config(page_title="AI Survey Renumbering Tool", layout="wide")
     
     st.title("📊 AI-Powered Survey Renumbering Tool")
-    st.markdown("Automate survey column renumbering by matching a dataset (CSV/Excel) with a survey report (PDF). Now with support for monadic studies!")
+    st.markdown("Automate survey column renumbering by matching a dataset (CSV/Excel) with a survey report (PDF).")
     st.markdown("---")
 
     if 'review_df' not in st.session_state: st.session_state.review_df = None
     if 'original_df' not in st.session_state: st.session_state.original_df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
     if 'loaded_data_file_name' not in st.session_state: st.session_state.loaded_data_file_name = ""
-    if 'working_endpoint' not in st.session_state: st.session_state.working_endpoint = None
     
     aligner = QuestionNumberAligner()
 
@@ -484,10 +476,10 @@ def create_streamlit_app():
             # Show working endpoint
             if test_results['working_endpoint']:
                 st.success(f"✅ Found working endpoint!")
-                st.session_state.working_endpoint = test_results['working_endpoint']
                 st.code(test_results['working_endpoint'], language='text')
             else:
                 st.error("❌ No working endpoints found")
+                st.info("Let's try the v1 endpoint format instead...")
             
             # Show detailed results
             with st.expander("View Detailed Results"):
@@ -531,10 +523,6 @@ def create_streamlit_app():
 
     st.subheader("Step 1: Upload Your Files")
     
-    # Add a warning if no working endpoint is found
-    if not st.session_state.working_endpoint:
-        st.warning("⚠️ Please click '🔧 Test API Connection' in the sidebar to find a working endpoint before processing files.")
-    
     col1, col2 = st.columns(2)
     with col1:
         data_file = st.file_uploader("Upload Dataset (CSV/Excel)", type=['csv', 'xlsx'])
@@ -558,57 +546,54 @@ def create_streamlit_app():
     
     if st.session_state.original_df is not None and pdf_file:
         if st.button("🚀 Start Full Renumbering Process", type="primary", use_container_width=True):
-            if not st.session_state.working_endpoint:
-                st.error("Please test the API connection first by clicking '🔧 Test API Connection' in the sidebar.")
-            else:
-                st.session_state.questions = []
-                st.session_state.review_df = None
+            st.session_state.questions = []
+            st.session_state.review_df = None
+            
+            pdf_bytes = pdf_file.getvalue()
+            questions = aligner.extract_questions_with_gemini(pdf_bytes)
+            st.session_state.questions = questions
+
+            if questions:
+                st.success(f"✅ AI successfully extracted {len(questions)} questions.")
                 
-                pdf_bytes = pdf_file.getvalue()
-                questions = aligner.extract_questions_with_gemini(pdf_bytes)
-                st.session_state.questions = questions
+                column_headers = st.session_state.original_df.columns.tolist()
+                
+                # Use the selected batch size (automatic or manual)
+                match_results_dict = aligner.match_with_gemini_in_batches(
+                    questions, 
+                    column_headers,
+                    batch_size=manual_batch_size  # Will be None for automatic mode
+                )
 
-                if questions:
-                    st.success(f"✅ AI successfully extracted {len(questions)} questions.")
-                    
-                    column_headers = st.session_state.original_df.columns.tolist()
-                    
-                    # Use the selected batch size (automatic or manual)
-                    match_results_dict = aligner.match_with_gemini_in_batches(
-                        questions, 
-                        column_headers,
-                        batch_size=manual_batch_size  # Will be None for automatic mode
-                    )
-
-                    if match_results_dict:
-                        reconstructed_list = []
-                        for i, header in enumerate(column_headers):
-                            mapping_info = match_results_dict.get(str(i), {
-                                "assigned_question": "UNMATCHED",
-                                "reasoning": "AI did not provide a mapping for this index."
-                            })
-                            
-                            reconstructed_list.append({
-                                "column_index": i,
-                                "original_header": header,
-                                "assigned_question": mapping_info.get("assigned_question", "UNMATCHED"),
-                                "reasoning": mapping_info.get("reasoning", "N/A")
-                            })
+                if match_results_dict:
+                    reconstructed_list = []
+                    for i, header in enumerate(column_headers):
+                        mapping_info = match_results_dict.get(str(i), {
+                            "assigned_question": "UNMATCHED",
+                            "reasoning": "AI did not provide a mapping for this index."
+                        })
                         
-                        review_df = pd.DataFrame(reconstructed_list)
-                        review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
-                        review_df.rename(columns={
-                            'original_header': 'Column Name',
-                            'assigned_question': 'Assigned #',
-                            'reasoning': 'AI Reasoning'
-                        }, inplace=True)
-                        st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
-                        st.success("✅ AI matching complete!")
-                    else:
-                        st.error("AI batch matching failed to produce results. Please check the errors above.")
-                        st.session_state.review_df = None
+                        reconstructed_list.append({
+                            "column_index": i,
+                            "original_header": header,
+                            "assigned_question": mapping_info.get("assigned_question", "UNMATCHED"),
+                            "reasoning": mapping_info.get("reasoning", "N/A")
+                        })
+                    
+                    review_df = pd.DataFrame(reconstructed_list)
+                    review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
+                    review_df.rename(columns={
+                        'original_header': 'Column Name',
+                        'assigned_question': 'Assigned #',
+                        'reasoning': 'AI Reasoning'
+                    }, inplace=True)
+                    st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
+                    st.success("✅ AI matching complete!")
                 else:
-                    st.error("AI question extraction failed. Cannot proceed with matching.")
+                    st.error("AI batch matching failed to produce results. Please check the errors above.")
+                    st.session_state.review_df = None
+            else:
+                st.error("AI question extraction failed. Cannot proceed with matching.")
 
     if st.session_state.questions:
         with st.expander(f"📋 Review Extracted Questions ({len(st.session_state.questions)} total)"):
@@ -641,6 +626,7 @@ def create_streamlit_app():
         st.markdown("---")
         st.subheader("Step 3: Download Renumbered File")
         st.warning("⚠️ Please click '✅ Confirm All Changes' above to apply your edits before downloading.")
+        
         col1, col2 = st.columns(2)
         with col1:
             prefix_format = st.selectbox(
