@@ -43,7 +43,8 @@ class QuestionNumberAligner:
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
         """
         api_key = self._get_api_key()
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # --- UPDATED LINE ---
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -77,7 +78,7 @@ class QuestionNumberAligner:
         }
 
         try:
-            with st.spinner("Calling Gemini 1.5 Pro to extract questions... This may take a moment."):
+            with st.spinner("Calling Gemini to extract questions... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
                 response.raise_for_status()
             response_json = response.json()
@@ -115,7 +116,8 @@ class QuestionNumberAligner:
         Returns a simple pipe-delimited string.
         """
         api_key = self._get_api_key()
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # --- UPDATED LINE ---
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
@@ -185,15 +187,12 @@ class QuestionNumberAligner:
         full_mapping = {}
         last_matched_q_num = 0
         
-        # Create a lookup dictionary from question number to Question object
-        # This handles non-integer question numbers like 'Q1' or '1a' by extracting the first integer
         question_lookup = {}
         for q in questions:
             match = re.search(r'\d+', q.number)
             if match:
                 question_lookup[int(match.group())] = q
         
-        # A sorted list of the integer question numbers
         question_indices = sorted(question_lookup.keys())
 
         num_batches = (len(column_headers) + batch_size - 1) // batch_size
@@ -206,22 +205,16 @@ class QuestionNumberAligner:
             
             column_batch_dict = {start_index + j: header for j, header in enumerate(batch_headers)}
 
-            # --- NEW: Focused Question Window Logic ---
-            # Find the index in our sorted list where we should start looking for questions
             window_start_index = 0
             for idx, q_num in enumerate(question_indices):
-                # Start the window from the last matched question number
                 if q_num > last_matched_q_num:
                     window_start_index = idx
                     break
             
-            # Define the end of the window to keep the prompt focused
-            window_end_index = min(window_start_index + 40, len(question_indices)) # Look at the next 40 questions
+            window_end_index = min(window_start_index + 40, len(question_indices))
             
-            # Slice the list of question numbers to get our window
             questions_in_window_indices = question_indices[window_start_index:window_end_index]
             
-            # Get the actual Question objects for the window
             questions_window = [question_lookup[q_num] for q_num in questions_in_window_indices]
 
             progress_text = f"Processing batch {i+1}/{num_batches} (Context: Start from Q{last_matched_q_num+1})"
@@ -249,9 +242,9 @@ class QuestionNumberAligner:
                         if current_q_num > max_q_in_batch:
                             max_q_in_batch = current_q_num
                 else:
-                    st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
+                    if line.strip():
+                        st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
             
-            # Only update if the AI found a new higher number
             if max_q_in_batch > last_matched_q_num:
                 last_matched_q_num = max_q_in_batch
             
