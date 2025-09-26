@@ -113,8 +113,8 @@ class QuestionNumberAligner:
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
         """
         api_key = self._get_api_key()
-        # Use v1beta endpoint which supports responseMimeType
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # Updated to use the correct model name
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -147,7 +147,7 @@ class QuestionNumberAligner:
             "generationConfig": {
                 "temperature": 0.1,
                 "maxOutputTokens": 8192,
-                "responseMimeType": "application/json"  # This is supported in v1beta
+                "responseMimeType": "application/json"
             },
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -160,6 +160,14 @@ class QuestionNumberAligner:
         try:
             with st.spinner("Calling Gemini 1.5 Pro to extract questions... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+                
+                # If we get a 404, try alternative model names
+                if response.status_code == 404:
+                    st.warning("Trying alternative model endpoint...")
+                    # Try without version suffix
+                    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+                    response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+                
                 response.raise_for_status()
                 
             response_json = response.json()
@@ -191,7 +199,7 @@ class QuestionNumberAligner:
             st.error(f"A network error occurred: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 st.error(f"Response status code: {e.response.status_code}")
-                st.error(f"Response text: {e.response.text[:500]}...")  # First 500 chars
+                st.error(f"Response text: {e.response.text[:500]}...")
             return []
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             st.error(f"Error parsing AI response for question extraction. The response may be malformed. Error: {e}")
@@ -208,8 +216,8 @@ class QuestionNumberAligner:
         Returns a simple pipe-delimited string.
         """
         api_key = self._get_api_key()
-        # Use v1beta endpoint for consistency
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # Updated to use the correct model name
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
@@ -246,7 +254,7 @@ class QuestionNumberAligner:
             "generationConfig": {
                 "temperature": 0.1,
                 "maxOutputTokens": 4096,
-                "responseMimeType": "text/plain"  # This is supported in v1beta
+                "responseMimeType": "text/plain"
             },
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -258,6 +266,12 @@ class QuestionNumberAligner:
         
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+            
+            # If we get a 404, try alternative model names
+            if response.status_code == 404:
+                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
+            
             response.raise_for_status()
             response_json = response.json()
 
