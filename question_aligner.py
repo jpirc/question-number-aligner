@@ -42,8 +42,8 @@ class QuestionNumberAligner:
         """Test the API connection with the recommended stable endpoint."""
         api_key = self._get_api_key()
         
-        # Using the single most reliable endpoint for testing
-        endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent"
+        # UPDATED: Testing with the Gemini 2.0 endpoint
+        endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent"
         
         test_payload = {
             "contents": [{"parts": [{"text": "Hello, please respond with 'API is working'"}]}]
@@ -106,8 +106,8 @@ class QuestionNumberAligner:
         """
         api_key = self._get_api_key()
         
-        # CORRECTED: Using the stable v1beta endpoint with the powerful 1.5 Pro model
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={api_key}"
+        # UPDATED: Using the stable Gemini 2.0 endpoint
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -199,8 +199,8 @@ class QuestionNumberAligner:
         """
         api_key = self._get_api_key()
         
-        # CORRECTED: Using the stable v1beta endpoint with the fast 1.5 Flash model for this task
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+        # UPDATED: Using the stable Gemini 2.0 endpoint
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
