@@ -113,8 +113,8 @@ class QuestionNumberAligner:
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
         """
         api_key = self._get_api_key()
-        # Updated API endpoint - removed 'beta'
-        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # Use v1beta endpoint which supports responseMimeType
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -136,9 +136,19 @@ class QuestionNumberAligner:
         Find every single question. Do not skip any. The output must be only the JSON object.
         """
         
+        # Add instruction to output JSON in the prompt
+        json_prompt = prompt + "\n\nIMPORTANT: Return ONLY valid JSON, no additional text or formatting."
+        
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}, {"inlineData": {"mimeType": "application/pdf", "data": encoded_pdf}}]}],
-            "generationConfig": {"responseMimeType": "application/json"},
+            "contents": [{"role": "user", "parts": [
+                {"text": json_prompt}, 
+                {"inlineData": {"mimeType": "application/pdf", "data": encoded_pdf}}
+            ]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 8192,
+                "responseMimeType": "application/json"  # This is supported in v1beta
+            },
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -150,14 +160,6 @@ class QuestionNumberAligner:
         try:
             with st.spinner("Calling Gemini 1.5 Pro to extract questions... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-                
-                # More detailed error handling for 404
-                if response.status_code == 404:
-                    st.error("API endpoint not found. Trying alternative endpoint...")
-                    # Try v1beta endpoint as fallback
-                    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
-                    response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-                
                 response.raise_for_status()
                 
             response_json = response.json()
@@ -170,6 +172,13 @@ class QuestionNumberAligner:
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
             extracted_json_text = content_part.get('text', '{}')
+            
+            # Clean up the response if needed
+            extracted_json_text = extracted_json_text.strip()
+            if extracted_json_text.startswith('```json'):
+                extracted_json_text = extracted_json_text[7:]
+            if extracted_json_text.endswith('```'):
+                extracted_json_text = extracted_json_text[:-3]
             
             question_data = json.loads(extracted_json_text)
             
@@ -186,7 +195,8 @@ class QuestionNumberAligner:
             return []
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             st.error(f"Error parsing AI response for question extraction. The response may be malformed. Error: {e}")
-            st.text_area("Raw AI Response", value=response.text if 'response' in locals() else "No response object.", height=200)
+            if 'extracted_json_text' in locals():
+                st.text_area("Extracted JSON Text", value=extracted_json_text, height=200)
             return []
         except Exception as e:
             st.error(f"An unexpected error occurred during AI Question Extraction: {e}")
@@ -198,8 +208,8 @@ class QuestionNumberAligner:
         Returns a simple pipe-delimited string.
         """
         api_key = self._get_api_key()
-        # Updated API endpoint - removed 'beta'
-        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={api_key}"
+        # Use v1beta endpoint for consistency
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
@@ -233,7 +243,11 @@ class QuestionNumberAligner:
 
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "text/plain"},
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 4096,
+                "responseMimeType": "text/plain"  # This is supported in v1beta
+            },
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -244,12 +258,6 @@ class QuestionNumberAligner:
         
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-            
-            # Try fallback endpoint if main one fails
-            if response.status_code == 404:
-                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
-                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-            
             response.raise_for_status()
             response_json = response.json()
 
@@ -263,6 +271,8 @@ class QuestionNumberAligner:
 
         except requests.exceptions.RequestException as e:
             st.error(f"A network error occurred during a batch match: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                st.error(f"Response text: {e.response.text[:500]}...")
             return ""
         except Exception as e:
             st.error(f"An unexpected error occurred during a batch match: {e}")
