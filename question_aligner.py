@@ -47,7 +47,6 @@ class QuestionNumberAligner:
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
     "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent",
-    "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
 ]
         
         test_payload = {
@@ -162,7 +161,7 @@ class QuestionNumberAligner:
         api_key = self._get_api_key()
         
         # Use v1 endpoint with the correct format
-        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -268,7 +267,7 @@ class QuestionNumberAligner:
         api_key = self._get_api_key()
         
         # Use v1 endpoint
-        api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
