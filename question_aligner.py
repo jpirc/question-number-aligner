@@ -43,10 +43,10 @@ class QuestionNumberAligner:
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
         """
         api_key = self._get_api_key()
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={api_key}"
-
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
+        
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
-
+        
         prompt = """
         You are a highly specialized text extraction tool. Your ONLY function is to scan the provided PDF and find every instance of a line that begins with a question number (e.g., "1.", "Q2.", "3.").
         Follow these steps:
@@ -64,7 +64,7 @@ class QuestionNumberAligner:
         }
         Find every single question. Do not skip any. The output must be only the JSON object.
         """
-
+        
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}, {"inlineData": {"mimeType": "application/pdf", "data": encoded_pdf}}]}],
             "generationConfig": {"responseMimeType": "application/json"},
@@ -81,7 +81,7 @@ class QuestionNumberAligner:
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
                 response.raise_for_status()
             response_json = response.json()
-
+            
             if not response_json.get('candidates'):
                 st.error("AI Question Extraction Failed: The API returned no candidates. This might be due to a content policy violation or an API error.")
                 st.json(response_json)
@@ -90,12 +90,12 @@ class QuestionNumberAligner:
             candidate = response_json.get('candidates', [{}])[0]
             content_part = candidate.get('content', {}).get('parts', [{}])[0]
             extracted_json_text = content_part.get('text', '{}')
-
+            
             question_data = json.loads(extracted_json_text)
-
+            
             questions = [Question(number=str(q['question_number']), text=q['question_text']) 
                          for q in question_data.get('questions', [])]
-
+            
             return sorted(questions, key=lambda q: int(re.search(r'\d+', q.number).group() if re.search(r'\d+', q.number) else 0))
 
         except requests.exceptions.RequestException as e:
@@ -115,7 +115,7 @@ class QuestionNumberAligner:
         Returns a simple pipe-delimited string.
         """
         api_key = self._get_api_key()
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={api_key}"
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
@@ -157,7 +157,7 @@ class QuestionNumberAligner:
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
             ]
         }
-
+        
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
             response.raise_for_status()
@@ -180,12 +180,10 @@ class QuestionNumberAligner:
 
     def match_with_gemini_in_batches(self, questions: List[Question], column_headers: List[str], batch_size: int = 150) -> Dict[str, Dict[str, str]]:
         """
-        Orchestrates the stateful, sequential matching process.
         Orchestrates the stateful, sequential matching process with a focused question window.
         """
         full_mapping = {}
         last_matched_q_num = 0
-        question_lookup = {int(re.search(r'\d+', q.number).group()): q for q in questions if re.search(r'\d+', q.number)}
         
         # Create a lookup dictionary from question number to Question object
         # This handles non-integer question numbers like 'Q1' or '1a' by extracting the first integer
@@ -205,24 +203,18 @@ class QuestionNumberAligner:
             start_index = i * batch_size
             end_index = start_index + batch_size
             batch_headers = column_headers[start_index:end_index]
-
+            
             column_batch_dict = {start_index + j: header for j, header in enumerate(batch_headers)}
 
-            # Create a "window" of questions for the AI to consider
-            window_start_q_num = max(0, last_matched_q_num - 5) # Look back a little
-            
-            # Find the index in our sorted list to start the window from
             # --- NEW: Focused Question Window Logic ---
             # Find the index in our sorted list where we should start looking for questions
             window_start_index = 0
             for idx, q_num in enumerate(question_indices):
-                if q_num >= window_start_q_num:
                 # Start the window from the last matched question number
                 if q_num > last_matched_q_num:
                     window_start_index = idx
                     break
-
-            questions_window = [question_lookup[q_num] for q_num in question_indices[window_start_index:]]
+            
             # Define the end of the window to keep the prompt focused
             window_end_index = min(window_start_index + 40, len(question_indices)) # Look at the next 40 questions
             
@@ -234,9 +226,9 @@ class QuestionNumberAligner:
 
             progress_text = f"Processing batch {i+1}/{num_batches} (Context: Start from Q{last_matched_q_num+1})"
             progress_bar.progress((i) / num_batches, text=progress_text)
-
+            
             response_string = self._match_batch_with_gemini(questions_window, column_batch_dict, last_matched_q_num)
-
+            
             if not response_string:
                 st.error(f"Batch {i+1} failed: Received an empty response from the AI. Stopping process.")
                 progress_bar.empty()
@@ -251,7 +243,6 @@ class QuestionNumberAligner:
                         "assigned_question": assigned_q_str,
                         "reasoning": reasoning
                     }
-                    # Update the last matched question number
                     match = re.search(r'\d+', assigned_q_str)
                     if match:
                         current_q_num = int(match.group())
@@ -259,8 +250,7 @@ class QuestionNumberAligner:
                             max_q_in_batch = current_q_num
                 else:
                     st.warning(f"Skipping malformed line in batch {i+1}: '{line}'")
-
-            last_matched_q_num = max_q_in_batch
+            
             # Only update if the AI found a new higher number
             if max_q_in_batch > last_matched_q_num:
                 last_matched_q_num = max_q_in_batch
@@ -279,13 +269,13 @@ class QuestionNumberAligner:
             return pd.DataFrame() 
 
         df_numbered = df.copy()
-
+        
         mapping = pd.Series(final_mapping_df['Assigned #'].values, index=final_mapping_df['Column Name']).to_dict()
 
         if not include_unmatched:
             matched_cols = [col for col, q_num in mapping.items() if str(q_num) != 'UNMATCHED']
             df_numbered = df_numbered[matched_cols]
-
+        
         new_columns = {}
         for col in df_numbered.columns:
             q_num = mapping.get(col)
@@ -294,14 +284,14 @@ class QuestionNumberAligner:
                 new_columns[col] = f"{prefix_format.format(num=num_only)}{col}"
             else:
                 new_columns[col] = col
-
+                
         df_numbered.rename(columns=new_columns, inplace=True)
         return df_numbered
 
 # --- Streamlit UI ---
 def create_streamlit_app():
     st.set_page_config(page_title="AI Survey Renumbering Tool", layout="wide")
-
+    
     st.title("📊 AI-Powered Survey Renumbering Tool")
     st.markdown("Automate survey column renumbering by matching a dataset (CSV/Excel) with a survey report (PDF). Now with support for monadic studies!")
     st.markdown("---")
@@ -310,7 +300,7 @@ def create_streamlit_app():
     if 'original_df' not in st.session_state: st.session_state.original_df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
     if 'loaded_data_file_name' not in st.session_state: st.session_state.loaded_data_file_name = ""
-
+    
     aligner = QuestionNumberAligner()
 
     st.subheader("Step 1: Upload Your Files")
@@ -334,19 +324,19 @@ def create_streamlit_app():
             st.session_state.original_df = None
 
     st.markdown("---")
-
+    
     if st.session_state.original_df is not None and pdf_file:
         if st.button("🚀 Start Full Renumbering Process", type="primary", use_container_width=True):
             st.session_state.questions = []
             st.session_state.review_df = None
-
+            
             pdf_bytes = pdf_file.getvalue()
             questions = aligner.extract_questions_with_gemini(pdf_bytes)
             st.session_state.questions = questions
 
             if questions:
                 st.success(f"✅ AI successfully extracted {len(questions)} questions.")
-
+                
                 column_headers = st.session_state.original_df.columns.tolist()
                 match_results_dict = aligner.match_with_gemini_in_batches(questions, column_headers)
 
@@ -357,14 +347,14 @@ def create_streamlit_app():
                             "assigned_question": "UNMATCHED",
                             "reasoning": "AI did not provide a mapping for this index."
                         })
-
+                        
                         reconstructed_list.append({
                             "column_index": i,
                             "original_header": header,
                             "assigned_question": mapping_info.get("assigned_question", "UNMATCHED"),
                             "reasoning": mapping_info.get("reasoning", "N/A")
                         })
-
+                    
                     review_df = pd.DataFrame(reconstructed_list)
                     review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
                     review_df.rename(columns={
@@ -388,7 +378,7 @@ def create_streamlit_app():
     if st.session_state.review_df is not None:
         st.markdown("---")
         st.subheader("Step 2: Review and Manually Edit Matches")
-
+        
         edited_df = st.data_editor(
             st.session_state.review_df,
             column_config={
@@ -402,7 +392,7 @@ def create_streamlit_app():
             height=500,
             key="editor"
         )
-
+        
         if st.button("✅ Confirm All Changes", type="primary"):
             st.session_state.review_df = edited_df
             st.toast("Changes confirmed and saved!", icon="👍")
@@ -411,7 +401,7 @@ def create_streamlit_app():
         st.markdown("---")
         st.subheader("Step 3: Download Renumbered File")
         st.warning("⚠️ Please click '✅ Confirm All Changes' above to apply your edits before downloading.")
-
+        
         col1, col2 = st.columns(2)
         with col1:
             prefix_format = st.selectbox(
@@ -421,18 +411,18 @@ def create_streamlit_app():
             )
         with col2:
             include_unmatched = st.checkbox("Include unmatched columns in final file", value=True)
-
+        
         final_df = aligner.apply_numbering_to_dataset(
             st.session_state.original_df, 
             st.session_state.review_df,
             prefix_format,
             include_unmatched
         )
-
+        
         if not final_df.empty:
             st.markdown("##### Preview of Renumbered Data")
             st.dataframe(final_df.head())
-
+            
             base_filename = os.path.splitext(st.session_state.loaded_data_file_name)[0]
             renumbered_excel_filename = f"{base_filename}_renumbered.xlsx"
             renumbered_csv_filename = f"{base_filename}_renumbered.csv"
@@ -450,7 +440,7 @@ def create_streamlit_app():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
-
+            
             with c2:
                 csv = final_df.to_csv(index=False, encoding='utf-8-sig')
                 st.download_button(
