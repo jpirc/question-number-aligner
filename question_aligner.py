@@ -38,6 +38,57 @@ class QuestionNumberAligner:
             st.stop()
         return api_key
 
+    def test_api_connection(self) -> Dict[str, Any]:
+        """Test the API connection with various endpoints."""
+        api_key = self._get_api_key()
+        
+        # List of endpoints to try
+        endpoints = [
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+        ]
+        
+        test_payload = {
+            "contents": [{"role": "user", "parts": [{"text": "Hello, please respond with 'API is working'"}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 50
+            }
+        }
+        
+        results = {}
+        working_endpoint = None
+        
+        for endpoint in endpoints:
+            url = f"{endpoint}?key={api_key}"
+            try:
+                response = requests.post(url, json=test_payload, headers={'Content-Type': 'application/json'}, timeout=10)
+                if response.status_code == 200:
+                    results[endpoint] = {"status": "✅ SUCCESS", "response": response.json()}
+                    if not working_endpoint:
+                        working_endpoint = endpoint
+                else:
+                    results[endpoint] = {"status": f"❌ Error {response.status_code}", "error": response.text[:200]}
+            except Exception as e:
+                results[endpoint] = {"status": "❌ Connection Failed", "error": str(e)}
+        
+        # Also test listing available models
+        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        try:
+            response = requests.get(list_url, timeout=10)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                model_names = [m.get('name', '') for m in models]
+                results['available_models'] = model_names
+            else:
+                results['available_models'] = f"Could not list models: {response.status_code}"
+        except Exception as e:
+            results['available_models'] = f"Error listing models: {str(e)}"
+        
+        return {"results": results, "working_endpoint": working_endpoint}
+
     def calculate_optimal_batch_size(self, 
                                    total_columns: int, 
                                    total_questions: int,
@@ -113,8 +164,10 @@ class QuestionNumberAligner:
         Sends a PDF file to the Gemini API to extract a clean list of numbered questions.
         """
         api_key = self._get_api_key()
-        # Updated to use the correct model name
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={api_key}"
+        
+        # Try to get the working endpoint from session state
+        working_endpoint = st.session_state.get('working_endpoint', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent')
+        api_url = f"{working_endpoint}?key={api_key}"
         
         encoded_pdf = base64.b64encode(pdf_file_bytes).decode('utf-8')
         
@@ -158,16 +211,8 @@ class QuestionNumberAligner:
         }
 
         try:
-            with st.spinner("Calling Gemini 1.5 Pro to extract questions... This may take a moment."):
+            with st.spinner("Calling Gemini API to extract questions... This may take a moment."):
                 response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-                
-                # If we get a 404, try alternative model names
-                if response.status_code == 404:
-                    st.warning("Trying alternative model endpoint...")
-                    # Try without version suffix
-                    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
-                    response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-                
                 response.raise_for_status()
                 
             response_json = response.json()
@@ -216,8 +261,10 @@ class QuestionNumberAligner:
         Returns a simple pipe-delimited string.
         """
         api_key = self._get_api_key()
-        # Updated to use the correct model name
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={api_key}"
+        
+        # Use the working endpoint from session state
+        working_endpoint = st.session_state.get('working_endpoint', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent')
+        api_url = f"{working_endpoint}?key={api_key}"
 
         compact_questions = "\n".join([f"{q.number}: {q.text}" for q in questions_window])
         formatted_columns = "\n".join([f'{idx}: "{header}"' for idx, header in column_batch.items()])
@@ -266,12 +313,6 @@ class QuestionNumberAligner:
         
         try:
             response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-            
-            # If we get a 404, try alternative model names
-            if response.status_code == 404:
-                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
-                response = requests.post(api_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=300)
-            
             response.raise_for_status()
             response_json = response.json()
 
@@ -425,12 +466,49 @@ def create_streamlit_app():
     if 'original_df' not in st.session_state: st.session_state.original_df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
     if 'loaded_data_file_name' not in st.session_state: st.session_state.loaded_data_file_name = ""
+    if 'working_endpoint' not in st.session_state: st.session_state.working_endpoint = None
     
     aligner = QuestionNumberAligner()
 
     # Sidebar for advanced settings
     with st.sidebar:
         st.subheader("⚙️ Advanced Settings")
+        
+        # Add API test button
+        if st.button("🔧 Test API Connection", type="secondary"):
+            with st.spinner("Testing API endpoints..."):
+                test_results = aligner.test_api_connection()
+                
+            st.subheader("API Test Results")
+            
+            # Show working endpoint
+            if test_results['working_endpoint']:
+                st.success(f"✅ Found working endpoint!")
+                st.session_state.working_endpoint = test_results['working_endpoint']
+                st.code(test_results['working_endpoint'], language='text')
+            else:
+                st.error("❌ No working endpoints found")
+            
+            # Show detailed results
+            with st.expander("View Detailed Results"):
+                for endpoint, result in test_results['results'].items():
+                    if endpoint != 'available_models':
+                        st.text(f"\nEndpoint: {endpoint}")
+                        st.text(f"Status: {result.get('status', 'Unknown')}")
+                        if 'error' in result:
+                            st.text(f"Error: {result['error'][:200]}...")
+                
+                # Show available models
+                if 'available_models' in test_results['results']:
+                    st.subheader("Available Models:")
+                    models = test_results['results']['available_models']
+                    if isinstance(models, list):
+                        for model in models:
+                            st.text(f"  - {model}")
+                    else:
+                        st.text(models)
+        
+        st.divider()
         
         # Batch size options
         batch_option = st.radio(
@@ -452,6 +530,11 @@ def create_streamlit_app():
             manual_batch_size = None
 
     st.subheader("Step 1: Upload Your Files")
+    
+    # Add a warning if no working endpoint is found
+    if not st.session_state.working_endpoint:
+        st.warning("⚠️ Please click '🔧 Test API Connection' in the sidebar to find a working endpoint before processing files.")
+    
     col1, col2 = st.columns(2)
     with col1:
         data_file = st.file_uploader("Upload Dataset (CSV/Excel)", type=['csv', 'xlsx'])
@@ -475,54 +558,57 @@ def create_streamlit_app():
     
     if st.session_state.original_df is not None and pdf_file:
         if st.button("🚀 Start Full Renumbering Process", type="primary", use_container_width=True):
-            st.session_state.questions = []
-            st.session_state.review_df = None
-            
-            pdf_bytes = pdf_file.getvalue()
-            questions = aligner.extract_questions_with_gemini(pdf_bytes)
-            st.session_state.questions = questions
-
-            if questions:
-                st.success(f"✅ AI successfully extracted {len(questions)} questions.")
-                
-                column_headers = st.session_state.original_df.columns.tolist()
-                
-                # Use the selected batch size (automatic or manual)
-                match_results_dict = aligner.match_with_gemini_in_batches(
-                    questions, 
-                    column_headers,
-                    batch_size=manual_batch_size  # Will be None for automatic mode
-                )
-
-                if match_results_dict:
-                    reconstructed_list = []
-                    for i, header in enumerate(column_headers):
-                        mapping_info = match_results_dict.get(str(i), {
-                            "assigned_question": "UNMATCHED",
-                            "reasoning": "AI did not provide a mapping for this index."
-                        })
-                        
-                        reconstructed_list.append({
-                            "column_index": i,
-                            "original_header": header,
-                            "assigned_question": mapping_info.get("assigned_question", "UNMATCHED"),
-                            "reasoning": mapping_info.get("reasoning", "N/A")
-                        })
-                    
-                    review_df = pd.DataFrame(reconstructed_list)
-                    review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
-                    review_df.rename(columns={
-                        'original_header': 'Column Name',
-                        'assigned_question': 'Assigned #',
-                        'reasoning': 'AI Reasoning'
-                    }, inplace=True)
-                    st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
-                    st.success("✅ AI matching complete!")
-                else:
-                    st.error("AI batch matching failed to produce results. Please check the errors above.")
-                    st.session_state.review_df = None
+            if not st.session_state.working_endpoint:
+                st.error("Please test the API connection first by clicking '🔧 Test API Connection' in the sidebar.")
             else:
-                st.error("AI question extraction failed. Cannot proceed with matching.")
+                st.session_state.questions = []
+                st.session_state.review_df = None
+                
+                pdf_bytes = pdf_file.getvalue()
+                questions = aligner.extract_questions_with_gemini(pdf_bytes)
+                st.session_state.questions = questions
+
+                if questions:
+                    st.success(f"✅ AI successfully extracted {len(questions)} questions.")
+                    
+                    column_headers = st.session_state.original_df.columns.tolist()
+                    
+                    # Use the selected batch size (automatic or manual)
+                    match_results_dict = aligner.match_with_gemini_in_batches(
+                        questions, 
+                        column_headers,
+                        batch_size=manual_batch_size  # Will be None for automatic mode
+                    )
+
+                    if match_results_dict:
+                        reconstructed_list = []
+                        for i, header in enumerate(column_headers):
+                            mapping_info = match_results_dict.get(str(i), {
+                                "assigned_question": "UNMATCHED",
+                                "reasoning": "AI did not provide a mapping for this index."
+                            })
+                            
+                            reconstructed_list.append({
+                                "column_index": i,
+                                "original_header": header,
+                                "assigned_question": mapping_info.get("assigned_question", "UNMATCHED"),
+                                "reasoning": mapping_info.get("reasoning", "N/A")
+                            })
+                        
+                        review_df = pd.DataFrame(reconstructed_list)
+                        review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
+                        review_df.rename(columns={
+                            'original_header': 'Column Name',
+                            'assigned_question': 'Assigned #',
+                            'reasoning': 'AI Reasoning'
+                        }, inplace=True)
+                        st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
+                        st.success("✅ AI matching complete!")
+                    else:
+                        st.error("AI batch matching failed to produce results. Please check the errors above.")
+                        st.session_state.review_df = None
+                else:
+                    st.error("AI question extraction failed. Cannot proceed with matching.")
 
     if st.session_state.questions:
         with st.expander(f"📋 Review Extracted Questions ({len(st.session_state.questions)} total)"):
@@ -555,7 +641,6 @@ def create_streamlit_app():
         st.markdown("---")
         st.subheader("Step 3: Download Renumbered File")
         st.warning("⚠️ Please click '✅ Confirm All Changes' above to apply your edits before downloading.")
-        
         col1, col2 = st.columns(2)
         with col1:
             prefix_format = st.selectbox(
