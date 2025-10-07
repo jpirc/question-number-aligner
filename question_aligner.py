@@ -9,6 +9,11 @@ import streamlit as st
 import io
 import os
 import time
+import time, os, pathlib, streamlit as st
+
+st.caption(f"App boot: {time.strftime('%Y-%m-%d %H:%M:%S')} (CT)")
+st.caption(f"Script mtime: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(pathlib.Path(__file__).stat().st_mtime))}")
+st.caption(f"Config present: {os.path.exists('.streamlit/config.toml')}")
 
 
 # --- Streamlit Arrow safety helpers (auto-injected) ---
