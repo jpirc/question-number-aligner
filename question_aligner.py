@@ -10,6 +10,51 @@ import io
 import os
 import time
 
+
+# --- Streamlit Arrow safety helpers (auto-injected) ---
+def sanitize_for_arrow(df: 'pd.DataFrame') -> 'pd.DataFrame':
+    """Coerce mixed-type columns to strings to avoid PyArrow serialization errors.
+    Leaves purely numeric columns unchanged. Non-destructive to original df.
+    """
+    try:
+        fixed = df.copy()
+        for col in fixed.columns:
+            try:
+                # If column mixes Python types (e.g., int and str), Arrow can choke.
+                # Count unique types; NaN handled via type(None) when present.
+                types_in_col = fixed[col].map(type).nunique(dropna=False)
+            except Exception:
+                # If mapping types fails (e.g., for extension arrays), fall back to safe cast
+                types_in_col = 2
+            if types_in_col and types_in_col > 1:
+                fixed[col] = fixed[col].astype(str)
+        return fixed
+    except Exception:
+        # Last resort: stringify entire frame
+        return df.astype(str)
+
+def _normalize_width_kwargs(kwargs: dict) -> dict:
+    """Replace deprecated use_container_width with width per Streamlit 1.50+."""
+    kw = dict(kwargs) if kwargs else {}
+    if 'use_container_width' in kw:
+        val = kw.pop('use_container_width')
+        kw['width'] = 'stretch' if bool(val) else 'content'
+    # If width not set, default to 'stretch' to match prior True usage
+    kw.setdefault('width', 'stretch')
+    return kw
+
+def st_df(df, **kwargs):
+    """Drop-in wrapper for st.dataframe with Arrow safety + width normalization."""
+    kw = _normalize_width_kwargs(kwargs)
+    return st.dataframe(sanitize_for_arrow(df), **kw)
+
+def st_data_editor(df, **kwargs):
+    """Wrapper for st.data_editor with Arrow safety + width normalization."""
+    kw = _normalize_width_kwargs(kwargs)
+    func = getattr(st, 'data_editor', st.dataframe)
+    return func(sanitize_for_arrow(df), **kw)(sanitize_for_arrow(df), **kw)
+
+
 # --- Data Classes ---
 @dataclass
 class Question:
@@ -319,7 +364,7 @@ def create_streamlit_app():
     st.markdown("---")
     
     if st.session_state.original_df is not None and pdf_file:
-        if st.button("🚀 Start Full Renumbering Process", type="primary", use_container_width=True):
+        if st.button("🚀 Start Full Renumbering Process", type="primary", width='stretch'):
             st.session_state.questions = []
             st.session_state.review_df = None
             
@@ -366,13 +411,13 @@ def create_streamlit_app():
     if st.session_state.questions:
         with st.expander(f"📋 Review Extracted Questions ({len(st.session_state.questions)} total)"):
             questions_df = pd.DataFrame([q.__dict__ for q in st.session_state.questions])
-            st.dataframe(questions_df, use_container_width=True, height=300)
+            st_df(questions_df, width='stretch', height=300)
 
     if st.session_state.review_df is not None:
         st.markdown("---")
         st.subheader("Step 2: Review and Manually Edit Matches")
         
-        edited_df = st.data_editor(
+        edited_df = st_data_editor(
             st.session_state.review_df,
             column_config={
                 "Col": st.column_config.TextColumn("Col", width="small", disabled=True),
@@ -380,7 +425,7 @@ def create_streamlit_app():
                 "Assigned #": st.column_config.TextColumn("Assigned # (Editable)"),
                 "AI Reasoning": st.column_config.TextColumn("AI Reasoning", width="large", disabled=True)
             },
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             height=500,
             key="editor"
@@ -414,7 +459,7 @@ def create_streamlit_app():
         
         if not final_df.empty:
             st.markdown("##### Preview of Renumbered Data")
-            st.dataframe(final_df.head())
+            st_df(final_df.head())
             
             base_filename = os.path.splitext(st.session_state.loaded_data_file_name)[0]
             renumbered_excel_filename = f"{base_filename}_renumbered.xlsx"
@@ -431,7 +476,7 @@ def create_streamlit_app():
                     data=excel_data,
                     file_name=renumbered_excel_filename,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    width='stretch'
                 )
             
             with c2:
@@ -441,7 +486,7 @@ def create_streamlit_app():
                     data=csv,
                     file_name=renumbered_csv_filename,
                     mime="text/csv",
-                    use_container_width=True
+                    width='stretch'
                 )
 
 if __name__ == "__main__":
