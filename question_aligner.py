@@ -51,8 +51,12 @@ def st_df(df, **kwargs):
 def st_data_editor(df, **kwargs):
     """Wrapper for st.data_editor with Arrow safety + width normalization."""
     kw = _normalize_width_kwargs(kwargs)
-    func = getattr(st, 'data_editor', st.dataframe)
-    return func(sanitize_for_arrow(df), **kw)(sanitize_for_arrow(df), **kw)
+    # Prefer data_editor when available; fall back to dataframe for older Streamlit
+    if hasattr(st, "data_editor"):
+        return st.data_editor(sanitize_for_arrow(df), **kw)
+    else:
+        return st.dataframe(sanitize_for_arrow(df), **kw)
+
 
 
 # --- Data Classes ---
