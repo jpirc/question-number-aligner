@@ -348,7 +348,7 @@ def create_streamlit_app():
     if 'questions' not in st.session_state: st.session_state.questions = []
     if 'loaded_data_file_name' not in st.session_state: st.session_state.loaded_data_file_name = ""
 
-aligner = QuestionNumberAligner()
+    aligner = QuestionNumberAligner()
 
     st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
