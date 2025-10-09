@@ -347,50 +347,6 @@ def create_streamlit_app():
     if 'original_df' not in st.session_state: st.session_state.original_df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
     if 'loaded_data_file_name' not in st.session_state: st.session_state.loaded_data_file_name = ""
-# ----------------------------
-# DEBUG: question header audit
-# ----------------------------
-import re, unicodedata, pandas as pd
-
-LOGFILE = "question_match_log.csv"
-
-QUESTION_PATS = [
-    (r"^\s*Q\s*(\d+)\b", "Q followed by number"),
-    (r"^\s*Question\s*(\d+)\b", "Word 'Question'"),
-    (r"^\s*(\d+)[\.\:\-\s]", "Leading number with punctuation"),
-]
-
-def _norm(h):
-    s = unicodedata.normalize("NFKC", str(h or ""))
-    s = s.replace("\u00A0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def audit_question_headers(df):
-    logs = []
-    for i, col in enumerate(df.columns):
-        raw = str(col)
-        norm = _norm(raw)
-        matched = None
-        qnum = None
-        for pat, label in QUESTION_PATS:
-            m = re.search(pat, norm, flags=re.I)
-            if m:
-                matched = label
-                qnum = m.group(1)
-                break
-        logs.append({
-            "index": i,
-            "raw_header": raw,
-            "normalized": norm,
-            "matched_pattern": matched,
-            "matched_qnum": qnum,
-        })
-    pd.DataFrame(logs).to_csv(LOGFILE, index=False)
-    print(f"✅ Saved header audit to {LOGFILE}")
-
-# Run the audit
-audit_question_headers(df)
 
 aligner = QuestionNumberAligner()
 
