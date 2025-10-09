@@ -1,3 +1,88 @@
+
+
+# ========= Question header detection utilities =========
+import unicodedata
+from typing import List, Tuple, Optional
+
+# Accepts "Q12", "Q 12", "Question 12", "12.", "12:" and "Q12a"/"Q12 a"
+QUESTION_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"^\s*Q\s*(\d+)\s*([a-z])?\b", re.I),            "Q + number [+ optional letter]"),
+    (re.compile(r"^\s*Question\s*(\d+)\s*([a-z])?\b", re.I),     "Word 'Question' + number"),
+    (re.compile(r"^\s*(\d+)\s*[\.\:\-\)]\s*([a-z])?\b", re.I),   "Leading number with punctuation"),
+]
+
+def normalize_header(h: str) -> str:
+    s = unicodedata.normalize("NFKC", str(h or ""))
+    s = s.replace("\u00A0", " ")             # non-breaking space
+    s = re.sub(r"\s+", " ", s).strip()       # collapse whitespace
+    return s
+
+def match_qnum_and_letter(name: str):
+    """Returns (qnum:int|None, letter:str|None, which_pattern:str|None)."""
+    norm = normalize_header(name)
+    for pat, label in QUESTION_PATTERNS:
+        m = pat.search(norm)
+        if m:
+            q = int(m.group(1))
+            letter = (m.group(2) or "").lower() if len(m.groups()) >= 2 else ""
+            letter = letter if letter else None
+            return q, letter, label
+    return None, None, None
+
+def inherit_unmatched_block_labels(review_df):
+    """Mutate review_df['Assigned #'] to fill UNMATCHED blocks between matched questions.
+    Uses last seen explicit question as base and assigns suffixes _a,_b,_c,... in order of column_index.
+    Leaves rows before the first explicit question untouched.
+    Expects columns: ['column_index','Column Name','Assigned #','AI Reasoning'] (Column Name may vary).
+    """
+    last_q = None
+    suffix_idx = 0
+
+    # Sort by column_index to ensure left-to-right order
+    if 'column_index' in review_df.columns:
+        order = review_df.sort_values('column_index').index.tolist()
+    else:
+        order = review_df.index.tolist()
+
+    for i in order:
+        assigned = str(review_df.at[i, 'Assigned #'])
+        colname = review_df.at[i, 'Column Name'] if 'Column Name' in review_df.columns else None
+        qnum, letter, _ = match_qnum_and_letter(colname or "")
+        # If AI already assigned an explicit Q label like Q12 or Q12_a, honor it and reset trackers
+        if assigned and assigned != 'UNMATCHED' and re.match(r"^Q\d+(?:_[a-z])?$", str(assigned), flags=re.I):
+            m = re.match(r"^Q(\d+)", str(assigned), flags=re.I)
+            if m:
+                last_q = int(m.group(1))
+            else:
+                last_q = None
+            suffix_idx = 0
+            continue
+
+        # If header itself reveals Q number, prefer that explicit signal
+        if qnum is not None:
+            last_q = qnum
+            if letter:
+                new_label = f"Q{qnum}_{letter}"
+            else:
+                new_label = f"Q{qnum}"
+            review_df.at[i, 'Assigned #'] = new_label
+            suffix_idx = 0
+            if 'AI Reasoning' in review_df.columns and (not isinstance(review_df.at[i,'AI Reasoning'], str) or not review_df.at[i,'AI Reasoning']):
+                review_df.at[i, 'AI Reasoning'] = "Detected explicit question pattern in header"
+            continue
+
+        # Otherwise if currently UNMATCHED and we have a last_q, assign inherited label
+        if assigned == 'UNMATCHED' and last_q is not None:
+            suffix = chr(ord('a') + (suffix_idx % 26))
+            new_label = f"Q{last_q}_{suffix}"
+            review_df.at[i, 'Assigned #'] = new_label
+            if 'AI Reasoning' in review_df.columns:
+                prev = str(review_df.at[i, 'AI Reasoning']) if 'AI Reasoning' in review_df.columns else ''
+                note = "; " if prev and prev != 'N/A' else ""
+                review_df.at[i, 'AI Reasoning'] = f"{prev}{note}Inherited from previous explicit question" if prev else "Inherited from previous explicit question"
+            suffix_idx += 1
+    return review_df
+
 import pandas as pd
 import re
 import json
@@ -9,60 +94,6 @@ import streamlit as st
 import io
 import os
 import time
-import time, os, pathlib, streamlit as st
-
-st.caption(f"App boot: {time.strftime('%Y-%m-%d %H:%M:%S')} (CT)")
-st.caption(f"Script mtime: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(pathlib.Path(__file__).stat().st_mtime))}")
-st.caption(f"Config present: {os.path.exists('.streamlit/config.toml')}")
-
-
-# --- Streamlit Arrow safety helpers (auto-injected) ---
-def sanitize_for_arrow(df: 'pd.DataFrame') -> 'pd.DataFrame':
-    """Coerce mixed-type columns to strings to avoid PyArrow serialization errors.
-    Leaves purely numeric columns unchanged. Non-destructive to original df.
-    """
-    try:
-        fixed = df.copy()
-        for col in fixed.columns:
-            try:
-                # If column mixes Python types (e.g., int and str), Arrow can choke.
-                # Count unique types; NaN handled via type(None) when present.
-                types_in_col = fixed[col].map(type).nunique(dropna=False)
-            except Exception:
-                # If mapping types fails (e.g., for extension arrays), fall back to safe cast
-                types_in_col = 2
-            if types_in_col and types_in_col > 1:
-                fixed[col] = fixed[col].astype(str)
-        return fixed
-    except Exception:
-        # Last resort: stringify entire frame
-        return df.astype(str)
-
-def _normalize_width_kwargs(kwargs: dict) -> dict:
-    """Replace deprecated use_container_width with width per Streamlit 1.50+."""
-    kw = dict(kwargs) if kwargs else {}
-    if 'use_container_width' in kw:
-        val = kw.pop('use_container_width')
-        kw['width'] = 'stretch' if bool(val) else 'content'
-    # If width not set, default to 'stretch' to match prior True usage
-    kw.setdefault('width', 'stretch')
-    return kw
-
-def st_df(df, **kwargs):
-    """Drop-in wrapper for st.dataframe with Arrow safety + width normalization."""
-    kw = _normalize_width_kwargs(kwargs)
-    return st.dataframe(sanitize_for_arrow(df), **kw)
-
-def st_data_editor(df, **kwargs):
-    """Wrapper for st.data_editor with Arrow safety + width normalization."""
-    kw = _normalize_width_kwargs(kwargs)
-    # Prefer data_editor when available; fall back to dataframe for older Streamlit
-    if hasattr(st, "data_editor"):
-        return st.data_editor(sanitize_for_arrow(df), **kw)
-    else:
-        return st.dataframe(sanitize_for_arrow(df), **kw)
-
-
 
 # --- Data Classes ---
 @dataclass
@@ -347,7 +378,7 @@ def create_streamlit_app():
     if 'original_df' not in st.session_state: st.session_state.original_df = None
     if 'questions' not in st.session_state: st.session_state.questions = []
     if 'loaded_data_file_name' not in st.session_state: st.session_state.loaded_data_file_name = ""
-
+    
     aligner = QuestionNumberAligner()
 
     st.subheader("Step 1: Upload Your Files")
@@ -403,14 +434,16 @@ def create_streamlit_app():
                         })
                     
                     review_df = pd.DataFrame(reconstructed_list)
-                    review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
-                    review_df.rename(columns={
-                        'original_header': 'Column Name',
-                        'assigned_question': 'Assigned #',
-                        'reasoning': 'AI Reasoning'
-                    }, inplace=True)
-                    st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
-                    st.success("✅ AI matching complete!")
+review_df['Col'] = [index_to_excel_col(i) for i in review_df['column_index']]
+review_df.rename(columns={
+    'original_header': 'Column Name',
+    'assigned_question': 'Assigned #',
+    'reasoning': 'AI Reasoning'
+}, inplace=True)
+# Fill any UNMATCHED blocks by inheriting labels based on adjacent explicit questions
+review_df = inherit_unmatched_block_labels(review_df)
+st.session_state.review_df = review_df[['Col', 'Column Name', 'Assigned #', 'AI Reasoning']]
+st.success("✅ AI matching complete!")
                 else:
                     st.error("AI batch matching failed to produce results. Please check the errors above.")
                     st.session_state.review_df = None
@@ -420,13 +453,13 @@ def create_streamlit_app():
     if st.session_state.questions:
         with st.expander(f"📋 Review Extracted Questions ({len(st.session_state.questions)} total)"):
             questions_df = pd.DataFrame([q.__dict__ for q in st.session_state.questions])
-            st_df(questions_df, width='stretch', height=300)
+            st.dataframe(questions_df, width='stretch', height=300)
 
     if st.session_state.review_df is not None:
         st.markdown("---")
         st.subheader("Step 2: Review and Manually Edit Matches")
         
-        edited_df = st_data_editor(
+        edited_df = st.data_editor(
             st.session_state.review_df,
             column_config={
                 "Col": st.column_config.TextColumn("Col", width="small", disabled=True),
@@ -468,7 +501,7 @@ def create_streamlit_app():
         
         if not final_df.empty:
             st.markdown("##### Preview of Renumbered Data")
-            st_df(final_df.head())
+            st.dataframe(final_df.head())
             
             base_filename = os.path.splitext(st.session_state.loaded_data_file_name)[0]
             renumbered_excel_filename = f"{base_filename}_renumbered.xlsx"
