@@ -392,8 +392,7 @@ def audit_question_headers(df):
 # Run the audit
 audit_question_headers(df)
 
-    
-    aligner = QuestionNumberAligner()
+aligner = QuestionNumberAligner()
 
     st.subheader("Step 1: Upload Your Files")
     col1, col2 = st.columns(2)
